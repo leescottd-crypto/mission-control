@@ -38,6 +38,15 @@ Optional NetSuite integration variables:
 - `NETSUITE_BASE_URL`
 - `NETSUITE_HEALTH_PATH`
 
+Authentication variables for office rollout:
+
+- `AUTH_ENABLED`
+- `NEXTAUTH_URL`
+- `NEXTAUTH_SECRET`
+- `AZURE_AD_CLIENT_ID`
+- `AZURE_AD_CLIENT_SECRET`
+- `AZURE_AD_TENANT_ID`
+
 ## Health Check
 
 Use:
@@ -54,8 +63,9 @@ For office-wide use, deploy with:
 
 1. `Vercel` for the web app
 2. `Postgres` for the database
-3. environment variables managed in the hosting platform
-4. uptime monitoring against `/api/health`
+3. `Microsoft Entra ID` for login
+4. environment variables managed in the hosting platform
+5. uptime monitoring against `/api/health`
 
 SQLite is fine for local development, but not the right long-term choice for a multi-user office deployment.
 
@@ -64,8 +74,9 @@ SQLite is fine for local development, but not the right long-term choice for a m
 ### Immediate
 
 1. Move `DATABASE_URL` from SQLite to managed Postgres
-2. Keep Prisma query logging disabled in production
-3. Deploy a shared production environment
+2. Turn on `AUTH_ENABLED=true` once Microsoft Entra ID variables are configured
+3. Keep Prisma query logging disabled in production
+4. Deploy a shared production environment
 
 ### Next
 
