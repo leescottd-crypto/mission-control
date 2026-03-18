@@ -2,7 +2,7 @@
 
 import { useMemo, useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
-import { format, subWeeks, addWeeks, addDays, startOfWeek } from "date-fns";
+import { format, subWeeks, addWeeks, addDays, startOfWeek, startOfMonth, endOfMonth } from "date-fns";
 import { ClickUpTask, TimeEntry } from "@/lib/clickup";
 import { AlertCircle, ChevronLeft, ChevronRight } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -12,6 +12,21 @@ interface CommandCenterProps {
     timeEntries: TimeEntry[];
     activeWeekStr: string;
     dbConfig: any;
+}
+
+interface ClientPaceTrackerRow {
+    id: string;
+    team: number;
+    client: string;
+    sa: string;
+    dealType: string;
+    wkMax: number;
+    plannedHours: number;
+    billedHours: number;
+    monthlyMax: number;
+    isPlannedOverMonthlyMax: boolean;
+    isOverMonthlyMax: boolean;
+    statusLabel: string;
 }
 
 const DEFAULT_LEAD_TARGETS: Record<string, number> = {
@@ -29,8 +44,9 @@ function normalizeName(value: string): string {
     return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
 }
 
-function getEffectiveHours(wt: number, wPlus: number): number {
-    return Math.abs(wPlus) > 0.0001 ? wPlus : wt;
+function getAllocationHours(cell: unknown) {
+    const legacyCell = cell as { hours?: number; wt?: number; wPlus?: number } | undefined;
+    return Number(legacyCell?.hours ?? Number(legacyCell?.wt ?? 0) + Number(legacyCell?.wPlus ?? 0));
 }
 
 export function CommandCenter({ tasks, timeEntries, activeWeekStr, dbConfig }: CommandCenterProps) {
@@ -70,10 +86,32 @@ export function CommandCenter({ tasks, timeEntries, activeWeekStr, dbConfig }: C
         return map;
     }, [tasks]);
 
+    const activeWeekStartMs = startOfWeek(activeWeekDate, { weekStartsOn: 1 }).getTime();
+    const activeWeekEndMs = addDays(new Date(activeWeekStartMs), 6).getTime();
+    const activeMonthStartDate = startOfMonth(activeWeekDate);
+    const activeMonthEndDate = endOfMonth(activeWeekDate);
+    const activeMonthStartMs = activeMonthStartDate.getTime();
+    const activeMonthEndMs = activeMonthEndDate.getTime();
+    const activeMonthLabel = format(activeMonthStartDate, "MMMM yyyy");
+
+    const activeWeekTimeEntries = useMemo(() => {
+        return timeEntries.filter((entry) => {
+            const entryStartMs = Number(entry?.start || 0);
+            return entryStartMs >= activeWeekStartMs && entryStartMs <= activeWeekEndMs;
+        });
+    }, [timeEntries, activeWeekStartMs, activeWeekEndMs]);
+
+    const activeMonthTimeEntries = useMemo(() => {
+        return timeEntries.filter((entry) => {
+            const entryStartMs = Number(entry?.start || 0);
+            return entryStartMs >= activeMonthStartMs && entryStartMs <= activeMonthEndMs;
+        });
+    }, [timeEntries, activeMonthStartMs, activeMonthEndMs]);
+
     // 1. Total Billed
     const totalBilledMs = useMemo(() => {
-        return timeEntries.reduce((acc, entry) => acc + (Number(entry.duration) || 0), 0);
-    }, [timeEntries]);
+        return activeWeekTimeEntries.reduce((acc, entry) => acc + (Number(entry.duration) || 0), 0);
+    }, [activeWeekTimeEntries]);
     const totalBilledHrs = totalBilledMs / (1000 * 60 * 60);
 
     // Gap calculations
@@ -148,14 +186,14 @@ export function CommandCenter({ tasks, timeEntries, activeWeekStr, dbConfig }: C
     const capacityHoursByClientKey = useMemo(() => {
         const result = new Map<string, number>();
         const rows = Array.isArray(dbConfig?.capacityGridConfig?.rows) ? dbConfig.capacityGridConfig.rows : [];
-        const resources = Array.isArray(dbConfig?.capacityGridConfig?.resources) ? dbConfig.capacityGridConfig.resources : [];
+        const resources = (Array.isArray(dbConfig?.capacityGridConfig?.resources) ? dbConfig.capacityGridConfig.resources : [])
+            .filter((resource: any) => !Boolean(resource?.removed));
 
         rows.forEach((row: any) => {
             const allocations = row?.allocations || {};
             const total = resources.reduce((sum: number, resource: any) => {
-                const wt = Number(allocations?.[resource.id]?.wt ?? 0);
-                const wPlus = Number(allocations?.[resource.id]?.wPlus ?? 0);
-                return sum + getEffectiveHours(wt, wPlus);
+                const hours = getAllocationHours(allocations?.[resource.id]);
+                return sum + hours;
             }, 0);
 
             const idKey = normalizeName(String(row?.id ?? ""));
@@ -169,15 +207,17 @@ export function CommandCenter({ tasks, timeEntries, activeWeekStr, dbConfig }: C
 
     const billedByClient = useMemo(() => {
         const map = new Map<string, number>();
-        timeEntries.forEach(entry => {
+        activeMonthTimeEntries.forEach(entry => {
             const taskMatch = tasksMap.get(entry.task?.id);
-            if (taskMatch?.list?.id) {
-                const current = map.get(taskMatch.list.id) || 0;
-                map.set(taskMatch.list.id, current + (Number(entry.duration) || 0));
-            }
+            const durationHours = (Number(entry.duration) || 0) / (1000 * 60 * 60);
+            if (durationHours <= 0) return;
+            const idKey = normalizeName(String(taskMatch?.list?.id ?? ""));
+            const nameKey = normalizeName(String(taskMatch?.list?.name ?? ""));
+            if (idKey) map.set(idKey, (map.get(idKey) || 0) + durationHours);
+            if (nameKey) map.set(nameKey, (map.get(nameKey) || 0) + durationHours);
         });
         return map;
-    }, [timeEntries, tasksMap]);
+    }, [activeMonthTimeEntries, tasksMap]);
 
     const [consultantConfigs, setConsultantConfigs] = useState<Record<number, { maxCapacity: number, billableCapacity: number, notes: string }>>(() => {
         const map: Record<number, any> = {};
@@ -255,14 +295,14 @@ export function CommandCenter({ tasks, timeEntries, activeWeekStr, dbConfig }: C
 
     const billedByConsultant = useMemo(() => {
         const map = new Map<number, number>();
-        timeEntries.forEach(entry => {
+        activeWeekTimeEntries.forEach(entry => {
             if (entry.user?.id) {
                 const current = map.get(entry.user.id) || 0;
                 map.set(entry.user.id, current + (Number(entry.duration) || 0));
             }
         });
         return map;
-    }, [timeEntries]);
+    }, [activeWeekTimeEntries]);
 
     const weeklyTrend = useMemo(() => {
         return Array.isArray(dbConfig?.weeklyTrend) ? dbConfig.weeklyTrend : [];
@@ -300,7 +340,7 @@ export function CommandCenter({ tasks, timeEntries, activeWeekStr, dbConfig }: C
     const thisWeekInitialForecast = useMemo(() => {
         return clients.reduce((sum, client) => {
             const cfg = clientConfigs[client.id];
-            const fallbackTotal = getEffectiveHours(Number(cfg?.mtHrs ?? 0), Number(cfg?.wPlusHrs ?? 0));
+            const fallbackTotal = Number(cfg?.mtHrs ?? 0) + Number(cfg?.wPlusHrs ?? 0);
             const idKey = normalizeName(client.id);
             const nameKey = normalizeName(client.name);
             const capacityTotal = capacityHoursByClientKey.get(idKey) ?? capacityHoursByClientKey.get(nameKey);
@@ -310,7 +350,7 @@ export function CommandCenter({ tasks, timeEntries, activeWeekStr, dbConfig }: C
 
     const lastWeekInitialForecast = useMemo(() => {
         return Object.values(previousClientConfigs).reduce((sum: number, cfg: any) => {
-            return sum + getEffectiveHours(Number(cfg?.mtHrs ?? 0), Number(cfg?.wPlusHrs ?? 0));
+            return sum + Number(cfg?.mtHrs ?? 0) + Number(cfg?.wPlusHrs ?? 0);
         }, 0);
     }, [previousClientConfigs]);
     const thisWeekBillableTarget = leads.reduce((sum, lead) => sum + Number(leadTargets[lead] || 0), 0);
@@ -447,67 +487,120 @@ export function CommandCenter({ tasks, timeEntries, activeWeekStr, dbConfig }: C
                 <div className="px-5 py-3 border-b border-border/50 bg-surface/30 flex items-center justify-between">
                     <div className="flex items-center gap-2">
                         <AlertCircle className="w-4 h-4 text-emerald-400" />
-                        <h3 className="text-sm font-semibold text-text-main">CLIENT PACE TRACKER</h3>
+                        <h3 className="text-sm font-semibold text-text-main">CLIENT PACE TRACKER — {activeMonthLabel}</h3>
                     </div>
                     <div className="text-xs text-text-muted">
-                        🔴 Behind (&lt;Min) | 🟡 At Risk (≥Min) | ✅ On Track (≥Target) | 🔶 Over Max (Dyna Flex rows are CONTRACTUAL)
+                        Monthly planned vs monthly billed. Client turns red when billed hours exceed the month max.
                     </div>
                 </div>
                 <div className="overflow-x-auto text-[13px]">
                     {(() => {
                         const capacityGridRows = Array.isArray(dbConfig?.capacityGridConfig?.rows) ? dbConfig.capacityGridConfig.rows : [];
-                        const capacityGridResources = Array.isArray(dbConfig?.capacityGridConfig?.resources) ? dbConfig.capacityGridConfig.resources : [];
+                        const capacityGridResources = (Array.isArray(dbConfig?.capacityGridConfig?.resources) ? dbConfig.capacityGridConfig.resources : [])
+                            .filter((resource: any) => !Boolean(resource?.removed));
 
-                        const cptRows = capacityGridRows.map((row: any, idx: number) => {
-                            const allocations = row?.allocations || {};
-                            const mtHrs = capacityGridResources.reduce((sum: number, resource: any) => sum + Number(allocations?.[resource.id]?.wt ?? 0), 0);
-                            const wPlusHrs = capacityGridResources.reduce((sum: number, resource: any) => sum + Number(allocations?.[resource.id]?.wPlus ?? 0), 0);
-                            const total = mtHrs + wPlusHrs;
-                            const wkMin = Number(row?.wkMin ?? 0);
-                            const wkMax = Number(row?.wkMax ?? 0);
-                            // Capacity grid does not have a separate target column today; target mirrors wk max.
-                            const wkTarget = Number(row?.wkMax ?? 0);
+                        const monthCapacityRows = new Map<string, {
+                            client: string;
+                            team: number;
+                            sa: string;
+                            dealType: string;
+                            wkMax: number;
+                            monthlyMax: number;
+                            plannedHours: number;
+                        }>();
 
-                            let statusIcon = "—";
-                            if (total > 0) {
-                                if (wkMax > 0 && total > wkMax) {
-                                    statusIcon = "🔶";
-                                } else if (wkTarget > 0 && total >= wkTarget) {
-                                    statusIcon = "✅";
-                                } else if (wkMin > 0 && total >= wkMin) {
-                                    statusIcon = "🟡";
-                                } else {
-                                    statusIcon = "🔴";
-                                }
-                            }
+                        const capacityGridWeeks = new Map<string, any>();
+                        const capacityGridConfigsForYear = Array.isArray(dbConfig?.capacityGridConfigsForYear) ? dbConfig.capacityGridConfigsForYear : [];
+                        capacityGridConfigsForYear.forEach((weekRow: any) => {
+                            const weekKey = String(weekRow?.week ?? "");
+                            if (!weekKey) return;
+                            capacityGridWeeks.set(weekKey, weekRow?.payload ?? null);
+                        });
+                        if (!capacityGridWeeks.has(activeWeekStr) && dbConfig?.capacityGridConfig) {
+                            capacityGridWeeks.set(activeWeekStr, dbConfig.capacityGridConfig);
+                        }
 
-                            const teamFromConfig = clientConfigs[String(row?.id ?? "")]?.team;
+                        capacityGridWeeks.forEach((payload: any, weekKey: string) => {
+                            const weekMs = new Date(`${weekKey}T00:00:00`).getTime();
+                            if (!Number.isFinite(weekMs) || weekMs < activeMonthStartMs || weekMs > activeMonthEndMs) return;
+
+                            const rows = Array.isArray(payload?.rows) ? payload.rows : [];
+                            const resources = (Array.isArray(payload?.resources) ? payload.resources : [])
+                                .filter((resource: any) => !Boolean(resource?.removed));
+
+                            rows.forEach((row: any, idx: number) => {
+                                const rowId = String(row?.id ?? `row-${idx + 1}`);
+                                const existing = monthCapacityRows.get(rowId) ?? {
+                                    client: String(row?.client ?? "Client"),
+                                    team: Number(row?.team ?? clientConfigs[rowId]?.team ?? 0),
+                                    sa: String(row?.teamSa ?? ""),
+                                    dealType: String(row?.dealType ?? ""),
+                                    wkMax: Number(row?.wkMax ?? 0),
+                                    monthlyMax: 0,
+                                    plannedHours: 0,
+                                };
+
+                                const allocations = row?.allocations || {};
+                                const rowPlannedHours = resources.reduce((sum: number, resource: any) => {
+                                    return sum + getAllocationHours(allocations?.[resource.id]);
+                                }, 0);
+
+                                existing.client = existing.client || String(row?.client ?? rowId);
+                                existing.team = Number(existing.team || row?.team || clientConfigs[rowId]?.team || 0);
+                                existing.sa = existing.sa || String(row?.teamSa ?? "");
+                                existing.dealType = existing.dealType || String(row?.dealType ?? "");
+                                existing.wkMax = Number(existing.wkMax || row?.wkMax || 0);
+                                existing.monthlyMax += Number(row?.wkMax ?? 0);
+                                existing.plannedHours += Number(rowPlannedHours ?? 0);
+
+                                monthCapacityRows.set(rowId, existing);
+                            });
+                        });
+
+                        const cptRows: ClientPaceTrackerRow[] = capacityGridRows.map((row: any, idx: number) => {
+                            const rowId = String(row?.id ?? `row-${idx + 1}`);
+                            const monthlyCapacity = monthCapacityRows.get(rowId);
+                            const idKey = normalizeName(rowId);
+                            const nameKey = normalizeName(String(row?.client ?? ""));
+                            const billedHours = Number(
+                                billedByClient.get(idKey)
+                                ?? billedByClient.get(nameKey)
+                                ?? 0
+                            );
+                            const wkMax = Number(row?.wkMax ?? monthlyCapacity?.wkMax ?? 0);
+                            const monthlyMax = Number(monthlyCapacity?.monthlyMax ?? 0);
+                            const plannedHours = Number(monthlyCapacity?.plannedHours ?? 0);
+                            const isPlannedOverMonthlyMax = monthlyMax > 0 && plannedHours > monthlyMax;
+                            const isOverMonthlyMax = monthlyMax > 0 && billedHours > monthlyMax;
+                            const statusLabel = isOverMonthlyMax ? "Billed Over Max" : isPlannedOverMonthlyMax ? "Planned Over Max" : "OK";
+                            const teamFromConfig = clientConfigs[rowId]?.team;
 
                             return {
-                                id: String(row?.id ?? `row-${idx + 1}`),
-                                team: Number(row?.team ?? teamFromConfig ?? 0),
-                                client: String(row?.client ?? "Client"),
-                                sa: String(row?.teamSa ?? ""),
-                                dealType: String(row?.dealType ?? ""),
-                                wkMin,
+                                id: rowId,
+                                team: Number(row?.team ?? teamFromConfig ?? monthlyCapacity?.team ?? 0),
+                                client: String(row?.client ?? monthlyCapacity?.client ?? "Client"),
+                                sa: String(row?.teamSa ?? monthlyCapacity?.sa ?? ""),
+                                dealType: String(row?.dealType ?? monthlyCapacity?.dealType ?? ""),
                                 wkMax,
-                                wkTarget,
-                                mtHrs,
-                                wPlusHrs,
-                                total,
-                                statusIcon,
+                                plannedHours,
+                                billedHours,
+                                monthlyMax,
+                                isPlannedOverMonthlyMax,
+                                isOverMonthlyMax,
+                                statusLabel,
                             };
                         });
 
-                        const cptTotals = cptRows.reduce((acc, row) => {
-                            acc.min += row.wkMin;
+                        const cptTotals = cptRows.reduce((
+                            acc: { max: number; monthlyMax: number; plannedHours: number; billedHours: number },
+                            row: any
+                        ) => {
                             acc.max += row.wkMax;
-                            acc.target += row.wkTarget;
-                            acc.mtHrs += row.mtHrs;
-                            acc.wPlusHrs += row.wPlusHrs;
-                            acc.total += row.total;
+                            acc.monthlyMax += row.monthlyMax;
+                            acc.plannedHours += row.plannedHours;
+                            acc.billedHours += row.billedHours;
                             return acc;
-                        }, { min: 0, max: 0, target: 0, mtHrs: 0, wPlusHrs: 0, total: 0 });
+                        }, { max: 0, monthlyMax: 0, plannedHours: 0, billedHours: 0 });
 
                         return (
                             <table className="w-full text-left border-collapse">
@@ -517,12 +610,10 @@ export function CommandCenter({ tasks, timeEntries, activeWeekStr, dbConfig }: C
                                         <th className="px-5 py-2.5 font-medium min-w-[160px] border-r border-dashed border-blue-400/30">Client</th>
                                         <th className="px-5 py-2.5 font-medium w-32 border-r border-dashed border-blue-400/30">SA</th>
                                         <th className="px-5 py-2.5 font-medium w-32 border-r border-dashed border-blue-400/30">Deal Type</th>
-                                        <th className="px-5 py-2.5 font-medium w-24 text-right border-r border-dashed border-blue-400/30">Wk Min</th>
                                         <th className="px-5 py-2.5 font-medium w-24 text-right border-r border-dashed border-blue-400/30">Wk Max</th>
-                                        <th className="px-5 py-2.5 font-medium w-24 text-right border-r-2 border-dashed border-blue-400/50">Wk Target</th>
-                                        <th className="px-5 py-2.5 font-medium w-24 text-right border-r border-dashed border-blue-400/30 bg-indigo-500/10">M/T Hrs</th>
-                                        <th className="px-5 py-2.5 font-medium w-24 text-right border-r border-dashed border-blue-400/40 bg-indigo-500/10">W+ Hrs</th>
-                                        <th className="px-5 py-2.5 font-medium w-24 font-bold text-white text-right border-r border-dashed border-blue-400/30 bg-indigo-500/10">Total</th>
+                                        <th className="px-5 py-2.5 font-medium w-28 text-right border-r border-dashed border-blue-400/30">Month Max</th>
+                                        <th className="px-5 py-2.5 font-medium w-28 font-bold text-white text-right border-r border-dashed border-blue-400/30 bg-indigo-500/10">Planned (Month)</th>
+                                        <th className="px-5 py-2.5 font-medium w-28 font-bold text-white text-right border-r border-dashed border-blue-400/30 bg-cyan-500/10">Billed (Month)</th>
                                         <th className="px-5 py-2.5 font-medium w-24 text-center">Status</th>
                                     </tr>
                                 </thead>
@@ -533,7 +624,14 @@ export function CommandCenter({ tasks, timeEntries, activeWeekStr, dbConfig }: C
                                                 <td className="px-5 py-2 text-text-muted border-r border-dashed border-blue-400/30 text-right tabular-nums text-xs">
                                                     {row.team > 0 ? row.team : "-"}
                                                 </td>
-                                                <td className="px-5 py-2 font-medium text-text-main border-r border-dashed border-blue-400/30">
+                                                <td className={cn(
+                                                    "px-5 py-2 font-medium border-r border-dashed border-blue-400/30",
+                                                    row.isOverMonthlyMax
+                                                        ? "text-red-400"
+                                                        : row.isPlannedOverMonthlyMax
+                                                        ? "text-amber-300"
+                                                        : "text-text-main"
+                                                )}>
                                                     <span className="text-xs font-medium">{row.client}</span>
                                                 </td>
                                                 <td className="px-5 py-2 border-r border-dashed border-blue-400/30 text-[11px] text-text-main">
@@ -543,28 +641,27 @@ export function CommandCenter({ tasks, timeEntries, activeWeekStr, dbConfig }: C
                                                     {row.dealType || "-"}
                                                 </td>
                                                 <td className="px-5 py-2 border-r border-dashed border-blue-400/30 text-text-main text-right tabular-nums text-xs">
-                                                    {row.wkMin.toFixed(1)}
-                                                </td>
-                                                <td className="px-5 py-2 border-r border-dashed border-blue-400/30 text-text-main text-right tabular-nums text-xs">
                                                     {row.wkMax > 0 ? row.wkMax.toFixed(1) : "-"}
                                                 </td>
-                                                <td className="px-5 py-2 border-r-2 border-dashed border-blue-400/50 text-text-main text-right tabular-nums text-xs font-medium">
-                                                    {row.wkTarget.toFixed(1)}
-                                                </td>
-                                                <td className="px-5 py-2 border-r border-dashed border-blue-400/30 bg-indigo-500/10">
-                                                    <div className="w-full py-0.5 text-indigo-100 font-medium text-xs text-right">
-                                                        {row.mtHrs > 0 ? row.mtHrs.toFixed(1) : "0"}
-                                                    </div>
-                                                </td>
-                                                <td className="px-5 py-2 border-r border-dashed border-blue-400/40 bg-indigo-500/10">
-                                                    <div className="w-full py-0.5 text-indigo-100 font-medium text-xs text-right">
-                                                        {row.wPlusHrs > 0 ? row.wPlusHrs.toFixed(1) : "0"}
-                                                    </div>
+                                                <td className="px-5 py-2 border-r border-dashed border-blue-400/30 text-text-main text-right tabular-nums text-xs">
+                                                    {row.monthlyMax > 0 ? row.monthlyMax.toFixed(1) : "-"}
                                                 </td>
                                                 <td className="px-5 py-2 bg-indigo-500/10 font-bold text-white text-right border-r border-dashed border-blue-400/30">
-                                                    {row.total > 0 ? row.total.toFixed(1) : "0"}
+                                                    {row.plannedHours > 0 ? row.plannedHours.toFixed(1) : "0"}
                                                 </td>
-                                                <td className="px-5 py-2 text-center text-lg">{row.statusIcon}</td>
+                                                <td className={cn("px-5 py-2 font-bold text-right border-r border-dashed border-blue-400/30", row.isOverMonthlyMax ? "bg-red-500/15 text-red-300" : "bg-cyan-500/10 text-cyan-100")}>
+                                                    {row.billedHours > 0 ? row.billedHours.toFixed(1) : "0"}
+                                                </td>
+                                                <td className={cn(
+                                                    "px-5 py-2 text-center text-xs font-semibold",
+                                                    row.isOverMonthlyMax
+                                                        ? "text-red-400"
+                                                        : row.isPlannedOverMonthlyMax
+                                                        ? "text-amber-300"
+                                                        : "text-emerald-400"
+                                                )}>
+                                                    {row.statusLabel}
+                                                </td>
                                             </tr>
                                         );
                                     })}
@@ -572,12 +669,10 @@ export function CommandCenter({ tasks, timeEntries, activeWeekStr, dbConfig }: C
                                 <tfoot className="bg-indigo-500/10 font-bold border-t border-border/50">
                                     <tr>
                                         <td colSpan={4} className="px-5 py-2.5 text-text-main text-[12px] uppercase tracking-wider text-right">TOTAL</td>
-                                        <td className="px-5 py-2.5 text-text-main text-[13px] text-right">{cptTotals.min > 0 ? cptTotals.min.toFixed(1) : "0"}</td>
                                         <td className="px-5 py-2.5 text-text-main text-[13px] text-right">{cptTotals.max > 0 ? cptTotals.max.toFixed(1) : "0"}</td>
-                                        <td className="px-5 py-2.5 text-text-main text-[13px] text-right">{cptTotals.target > 0 ? cptTotals.target.toFixed(1) : "0"}</td>
-                                        <td className="px-5 py-2.5 text-indigo-300 text-[13px] border-l border-border/30 text-right">{cptTotals.mtHrs > 0 ? cptTotals.mtHrs.toFixed(1) : "0"}</td>
-                                        <td className="px-5 py-2.5 text-indigo-300 text-[13px] text-right">{cptTotals.wPlusHrs > 0 ? cptTotals.wPlusHrs.toFixed(1) : "0"}</td>
-                                        <td className="px-5 py-2.5 text-white font-bold text-[13px] text-right">{cptTotals.total > 0 ? cptTotals.total.toFixed(1) : "0"}</td>
+                                        <td className="px-5 py-2.5 text-text-main text-[13px] text-right">{cptTotals.monthlyMax > 0 ? cptTotals.monthlyMax.toFixed(1) : "0"}</td>
+                                        <td className="px-5 py-2.5 text-white font-bold text-[13px] text-right">{cptTotals.plannedHours > 0 ? cptTotals.plannedHours.toFixed(1) : "0"}</td>
+                                        <td className="px-5 py-2.5 text-white font-bold text-[13px] text-right">{cptTotals.billedHours > 0 ? cptTotals.billedHours.toFixed(1) : "0"}</td>
                                         <td className="px-5 py-2.5 text-center text-xs"></td>
                                     </tr>
                                 </tfoot>

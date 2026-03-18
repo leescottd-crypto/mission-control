@@ -63,3 +63,61 @@ model CapacityGridConfig {
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 }
+
+model EditableTask {
+  id           String   @id @default(cuid())
+  week         String
+  scopeType    String
+  scopeId      String
+  sourceTaskId String?
+  subject      String
+  description  String   @default("")
+  assignee     String   @default("")
+  billableHoursToday Float @default(0)
+  status       String   @default("backlog")
+  position     Float    @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  billableEntries TaskBillableEntry[]
+
+  @@unique([week, scopeType, scopeId, sourceTaskId])
+  @@index([week, scopeType, scopeId, status, position])
+}
+
+model TaskBillableEntry {
+  id        String   @id @default(cuid())
+  taskId     String
+  entryDate String
+  hours     Float    @default(0)
+  note      String   @default("")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  task      EditableTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId, entryDate])
+}
+
+model TaskSidebarFolder {
+  id        String   @id @default(cuid())
+  name      String
+  orderIndex Int     @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model TaskSidebarBoard {
+  id            String   @id @default(cuid())
+  name          String
+  parentFolderId String
+  orderIndex    Int      @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([parentFolderId, orderIndex])
+}
+
+model TaskSidebarHiddenBoard {
+  id        String   @id @default(cuid())
+  boardId   String   @unique
+  createdAt DateTime @default(now())
+}

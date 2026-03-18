@@ -1,17 +1,17 @@
 "use client";
 
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect, useCallback } from "react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Sidebar, FolderWithLists } from "@/components/Sidebar";
-import { KanbanBoard } from "@/components/KanbanBoard";
+import { EditableTaskBoard } from "@/components/EditableTaskBoard";
 import { CommandCenter } from "@/components/CommandCenter";
-import { ProjectsBurndown } from "@/components/ProjectsBurndown";
 import { ProjectsBacklogGrowth } from "@/components/ProjectsBacklogGrowth";
 import { CapacityGrid } from "@/components/CapacityGrid";
 import { ConsultantUtilization } from "@/components/ConsultantUtilization";
 import { Trends } from "@/components/Trends";
 import { CapacityTrends } from "@/components/CapacityTrends";
-import { CapacityGridPayload } from "@/app/actions";
-import { groupTasksByStatus, ClickUpTask, TimeEntry, PROFESSIONAL_SERVICES_SPACE_ID } from "@/lib/clickup";
+import { CapacityGridPayload, EditableTaskBillableRollupRecord, TaskSidebarStructureRecord } from "@/app/actions";
+import { ClickUpTask, TimeEntry, PROFESSIONAL_SERVICES_SPACE_ID } from "@/lib/clickup";
 import { Rocket } from "lucide-react";
 
 interface DashboardClientProps {
@@ -22,10 +22,15 @@ interface DashboardClientProps {
     weekStartStr: string;
     dbConfig: any; // Mapped Prisma payload
     initialTab?: string;
+    initialSelectedListId?: string | null;
+    initialSelectedFolderId?: string | null;
+    initialAssigneeFilter?: string | null;
+    initialTaskBillableRollups?: EditableTaskBillableRollupRecord[];
+    initialSidebarStructure?: TaskSidebarStructureRecord;
 }
 
 const EMPTY_CAPACITY_GRID: CapacityGridPayload = { resources: [], rows: [] };
-const VALID_TABS = new Set(["issues", "command-center", "trends", "capacity-trends", "consultant-utilization", "capacity-grid", "projects", "backlog-growth"]);
+const VALID_TABS = new Set(["issues", "editable-tasks", "command-center", "trends", "capacity-trends", "consultant-utilization", "capacity-grid", "backlog-growth"]);
 const normalizeTab = (tab?: string) => (tab && VALID_TABS.has(tab) ? tab : "command-center");
 
 function pickPreferredConsultantName(currentName: string, incomingName: string) {
@@ -40,10 +45,27 @@ function pickPreferredConsultantName(currentName: string, incomingName: string) 
     return current;
 }
 
-export function DashboardClient({ initialTasks, initialFolders, initialTimeEntries, isError, weekStartStr, dbConfig, initialTab }: DashboardClientProps) {
-    const [selectedListId, setSelectedListId] = useState<string | null>(null);
-    const [selectedFolderId, setSelectedFolderId] = useState<string | null>(null);
-    const [activeTab, setActiveTab] = useState<string>(normalizeTab(initialTab));
+export function DashboardClient({
+    initialTasks,
+    initialFolders,
+    initialTimeEntries,
+    isError,
+    weekStartStr,
+    dbConfig,
+    initialTab,
+    initialSelectedListId = null,
+    initialSelectedFolderId = null,
+    initialAssigneeFilter = null,
+    initialTaskBillableRollups = [],
+    initialSidebarStructure = { folders: [], boards: [], hiddenBoardIds: [] },
+}: DashboardClientProps) {
+    const router = useRouter();
+    const pathname = usePathname();
+    const searchParams = useSearchParams();
+    const selectedListId = initialSelectedListId;
+    const selectedFolderId = initialSelectedFolderId;
+    const selectedAssigneeFilter = initialAssigneeFilter;
+    const activeTab = normalizeTab(initialTab);
     const [capacityGridState, setCapacityGridState] = useState<CapacityGridPayload>(dbConfig?.capacityGridConfig ?? EMPTY_CAPACITY_GRID);
     const resolvedActiveTab = normalizeTab(activeTab);
 
@@ -51,9 +73,32 @@ export function DashboardClient({ initialTasks, initialFolders, initialTimeEntri
         setCapacityGridState(dbConfig?.capacityGridConfig ?? EMPTY_CAPACITY_GRID);
     }, [weekStartStr, dbConfig?.capacityGridConfig]);
 
-    useEffect(() => {
-        setActiveTab(normalizeTab(initialTab));
-    }, [initialTab]);
+    const navigateWithState = useCallback((
+        nextTab: string,
+        nextListId: string | null,
+        nextFolderId: string | null,
+        nextAssignee: string | null = selectedAssigneeFilter
+    ) => {
+        const params = new URLSearchParams(searchParams.toString());
+        params.set("week", weekStartStr);
+        params.set("tab", normalizeTab(nextTab));
+        if (nextAssignee) {
+            params.set("assignee", nextAssignee);
+        } else {
+            params.delete("assignee");
+        }
+        if (nextListId) {
+            params.set("listId", nextListId);
+            params.delete("folderId");
+        } else if (nextFolderId) {
+            params.set("folderId", nextFolderId);
+            params.delete("listId");
+        } else {
+            params.delete("listId");
+            params.delete("folderId");
+        }
+        router.push(`${pathname}?${params.toString()}`, { scroll: false });
+    }, [pathname, router, searchParams, selectedAssigneeFilter, weekStartStr]);
 
     // Filter tasks down strictly to the Professional Services space
     const proServicesTasks = useMemo(() => {
@@ -62,53 +107,102 @@ export function DashboardClient({ initialTasks, initialFolders, initialTimeEntri
 
     const availableFolders = useMemo(() => {
         const shouldExcludeList = (name: string) => /user\s*guide/i.test(name);
+        const hiddenBoardIds = new Set((initialSidebarStructure?.hiddenBoardIds ?? []).map((id) => String(id)));
+        const localBoardsByFolderId = new Map<string, Array<{ id: string; name: string; source: "local" }>>();
+        (initialSidebarStructure?.boards ?? []).forEach((board) => {
+            if (hiddenBoardIds.has(String(board.id))) return;
+            const parentFolderId = String(board.parentFolderId ?? "");
+            const current = localBoardsByFolderId.get(parentFolderId) ?? [];
+            current.push({
+                id: String(board.id),
+                name: String(board.name),
+                source: "local",
+            });
+            localBoardsByFolderId.set(parentFolderId, current);
+        });
+
         if (initialFolders.length > 0) {
-            return initialFolders
+            const clickupFolders = initialFolders
                 .map((folder) => ({
                     ...folder,
-                    lists: folder.lists.filter((list) => !shouldExcludeList(list.name))
+                    source: "clickup" as const,
+                    lists: [
+                        ...folder.lists
+                            .filter((list) => !shouldExcludeList(list.name) && !hiddenBoardIds.has(String(list.id)))
+                            .map((list) => ({
+                            ...list,
+                            source: "clickup" as const,
+                        })),
+                        ...(localBoardsByFolderId.get(folder.id) ?? []),
+                    ],
                 }))
                 .filter((folder) => folder.lists.length > 0);
+
+            const localFolders = (initialSidebarStructure?.folders ?? []).map((folder) => ({
+                id: String(folder.id),
+                name: String(folder.name),
+                source: "local" as const,
+                lists: localBoardsByFolderId.get(String(folder.id)) ?? [],
+            }));
+
+            return [...clickupFolders, ...localFolders];
         }
 
-        const folderMap = new Map<string, { id: string, name: string, lists: Map<string, { id: string, name: string, statusOrder: string[] }> }>();
+        const folderMap = new Map<string, { id: string, name: string, source: "clickup", lists: Map<string, { id: string, name: string, statusOrder: string[], source: "clickup" }> }>();
         proServicesTasks.forEach((task) => {
             if (!task.folder?.id || !task.folder?.name) return;
             if (!folderMap.has(task.folder.id)) {
                 folderMap.set(task.folder.id, {
                     id: task.folder.id,
                     name: task.folder.name,
+                    source: "clickup",
                     lists: new Map()
                 });
             }
 
-            if (task.list?.id && task.list?.name) {
-                if (shouldExcludeList(task.list.name)) return;
-                folderMap.get(task.folder.id)!.lists.set(task.list.id, {
-                    id: task.list.id,
-                    name: task.list.name,
-                    statusOrder: []
+                if (task.list?.id && task.list?.name) {
+                    if (shouldExcludeList(task.list.name) || hiddenBoardIds.has(String(task.list.id))) return;
+                    folderMap.get(task.folder.id)!.lists.set(task.list.id, {
+                        id: task.list.id,
+                        name: task.list.name,
+                    statusOrder: [],
+                    source: "clickup",
                 });
             }
         });
 
-        return Array.from(folderMap.values()).map((folder) => ({
+        const clickupFolders = Array.from(folderMap.values()).map((folder) => ({
             id: folder.id,
             name: folder.name,
-            lists: Array.from(folder.lists.values())
+            source: folder.source,
+            lists: [
+                ...Array.from(folder.lists.values()),
+                ...(localBoardsByFolderId.get(folder.id) ?? []),
+            ]
         }));
-    }, [initialFolders, proServicesTasks]);
+        const localFolders = (initialSidebarStructure?.folders ?? []).map((folder) => ({
+            id: String(folder.id),
+            name: String(folder.name),
+            source: "local" as const,
+            lists: localBoardsByFolderId.get(String(folder.id)) ?? [],
+        }));
+
+        return [...clickupFolders, ...localFolders];
+    }, [initialFolders, initialSidebarStructure, proServicesTasks]);
 
     const handleListSelect = (listId: string | null) => {
-        setActiveTab("issues");
-        setSelectedListId((prev) => (prev === listId ? null : listId));
-        if (listId) setSelectedFolderId(null);
+        const nextTab = "issues";
+        navigateWithState(nextTab, listId, null);
     };
 
     const handleFolderSelect = (folderId: string | null) => {
-        setActiveTab("issues");
-        setSelectedFolderId((prev) => (prev === folderId ? null : folderId));
-        if (folderId) setSelectedListId(null);
+        const nextTab = "issues";
+        navigateWithState(nextTab, null, folderId);
+    };
+
+    const handleTabSelect = (tab: string) => {
+        const nextTab = VALID_TABS.has(tab) ? tab : "command-center";
+        navigateWithState(nextTab, selectedListId, selectedFolderId);
     };
 
     // 3. Slice tasks based on active Client (List) or Team (Folder)
@@ -122,21 +216,46 @@ export function DashboardClient({ initialTasks, initialFolders, initialTimeEntri
         return proServicesTasks;
     }, [proServicesTasks, selectedListId, selectedFolderId]);
 
-    const groupedTasks = useMemo(() => groupTasksByStatus(visibleTasks), [visibleTasks]);
-    const selectedListStatusOrder = useMemo(() => {
-        if (!selectedListId) return undefined;
-        for (const folder of availableFolders) {
-            const list = folder.lists.find((l) => l.id === selectedListId);
-            if (list?.statusOrder && list.statusOrder.length > 0) return list.statusOrder;
-        }
-        return undefined;
-    }, [availableFolders, selectedListId]);
-
     const projectOptions = useMemo(() => {
         return availableFolders
             .flatMap((folder) => folder.lists.map((list) => ({ id: list.id, name: list.name })))
             .sort((a, b) => a.name.localeCompare(b.name));
     }, [availableFolders]);
+
+    const editableTaskScope = useMemo(() => {
+        if (selectedListId) {
+            for (const folder of availableFolders) {
+                const list = folder.lists.find((item) => item.id === selectedListId);
+                if (list) {
+                    return {
+                        type: "list",
+                        id: selectedListId,
+                        name: list.name,
+                    } as const;
+                }
+            }
+            return {
+                type: "list",
+                id: selectedListId,
+                name: selectedListId,
+            } as const;
+        }
+
+        if (selectedFolderId) {
+            const folder = availableFolders.find((item) => item.id === selectedFolderId);
+            return {
+                type: "folder",
+                id: selectedFolderId,
+                name: folder?.name ?? selectedFolderId,
+            } as const;
+        }
+
+        return {
+            type: "all",
+            id: "all",
+            name: "All Clients",
+        } as const;
+    }, [availableFolders, selectedFolderId, selectedListId]);
 
     const consultantsFromTasks = useMemo(() => {
         const byId = new Map<number, string>();
@@ -154,9 +273,32 @@ export function DashboardClient({ initialTasks, initialFolders, initialTimeEntri
         return Array.from(byId.entries()).map(([id, name]) => ({ id, name }));
     }, [proServicesTasks]);
 
+    const consultantsForRoster = useMemo(() => {
+        const gridResources = Array.isArray(capacityGridState?.resources) ? capacityGridState.resources : [];
+        if (gridResources.length > 0) {
+            return gridResources
+                .map((resource: any, idx: number) => ({
+                    id: Number(resource?.consultantId ?? -(idx + 1)),
+                    name: String(resource?.name ?? "").trim(),
+                    removed: Boolean(resource?.removed ?? false),
+                }))
+                .filter((consultant) => consultant.name.length > 0);
+        }
+        return consultantsFromTasks;
+    }, [capacityGridState?.resources, consultantsFromTasks]);
+
+    const activeConsultantNames = useMemo(
+        () => consultantsForRoster
+            .filter((consultant) => !Boolean((consultant as any).removed))
+            .map((consultant) => consultant.name)
+            .filter((name) => name.length > 0)
+            .sort((a, b) => a.localeCompare(b)),
+        [consultantsForRoster]
+    );
+
     const baseConsultantConfigsById = useMemo(() => {
         const byId = new Map<number, { maxCapacity: number; billableCapacity: number; notes: string }>();
-        consultantsFromTasks.forEach((consultant) => {
+        consultantsForRoster.forEach((consultant) => {
             byId.set(consultant.id, { maxCapacity: 40, billableCapacity: 40, notes: "" });
         });
 
@@ -177,7 +319,7 @@ export function DashboardClient({ initialTasks, initialFolders, initialTimeEntri
             result[consultantId] = value;
         });
         return result;
-    }, [consultantsFromTasks, dbConfig?.consultantConfigs]);
+    }, [consultantsForRoster, dbConfig?.consultantConfigs]);
 
     const [consultantConfigsState, setConsultantConfigsState] = useState<Record<number, { maxCapacity: number; billableCapacity: number; notes: string }>>(baseConsultantConfigsById);
 
@@ -247,9 +389,11 @@ export function DashboardClient({ initialTasks, initialFolders, initialTimeEntri
                 selectedListId={selectedListId}
                 selectedFolderId={selectedFolderId}
                 activeTab={resolvedActiveTab}
+                weekStr={weekStartStr}
+                assigneeFilter={selectedAssigneeFilter}
                 onSelectList={handleListSelect}
                 onSelectFolder={handleFolderSelect}
-                onSelectTab={(tab) => setActiveTab(VALID_TABS.has(tab) ? tab : "command-center")}
+                onSelectTab={handleTabSelect}
                 teamsLabel="Clients"
             />
 
@@ -285,17 +429,16 @@ export function DashboardClient({ initialTasks, initialFolders, initialTimeEntri
                     {/* Conditional Rendering based on activeTab */}
                     {resolvedActiveTab === "issues" && (
                         <section className="flex-1 flex flex-col min-h-[400px]">
-                            <div className="flex items-center justify-between mb-4">
-                                <h2 className="text-sm font-medium text-text-main flex items-center gap-2">
-                                    <span className="w-1.5 h-1.5 rounded-full bg-primary" />
-                                    Initiatives
-                                    <span className="text-text-muted font-normal ml-2">({visibleTasks.length} total)</span>
-                                </h2>
-                            </div>
-
-                            <div className="flex-1 border bg-surface/30 border-border rounded-xl p-4 overflow-hidden shadow-inner transition-opacity duration-300">
-                                <KanbanBoard groupedTasks={groupedTasks} columnOrder={selectedListStatusOrder} />
-                            </div>
+                            <EditableTaskBoard
+                                activeWeekStr={weekStartStr}
+                                tasks={proServicesTasks}
+                                scopeType={editableTaskScope.type}
+                                scopeId={editableTaskScope.id}
+                                scopeName={editableTaskScope.name}
+                                assigneeOptions={activeConsultantNames}
+                                initialAssigneeFilter={selectedAssigneeFilter}
+                                tabId="issues"
+                            />
                         </section>
                     )}
 
@@ -337,9 +480,12 @@ export function DashboardClient({ initialTasks, initialFolders, initialTimeEntri
                                 activeWeekStr={weekStartStr}
                                 initialGrid={capacityGridState}
                                 onGridChange={setCapacityGridState}
-                                consultants={consultantsFromTasks}
+                                consultants={consultantsForRoster}
                                 consultantConfigsById={consultantConfigsState}
                                 tasks={proServicesTasks}
+                                folders={availableFolders}
+                                activeAssigneeFilter={selectedAssigneeFilter}
+                                billableRollups={initialTaskBillableRollups}
                             />
                         </section>
                     )}
@@ -348,19 +494,11 @@ export function DashboardClient({ initialTasks, initialFolders, initialTimeEntri
                         <section className="flex-1 flex flex-col min-h-[400px]">
                             <ConsultantUtilization
                                 activeWeekStr={weekStartStr}
-                                consultants={consultantsFromTasks}
+                                consultants={consultantsForRoster}
                                 consultantConfigsById={consultantConfigsState}
                                 capacityGrid={capacityGridState}
                                 onConsultantConfigChange={handleConsultantConfigChange}
-                            />
-                        </section>
-                    )}
-
-                    {resolvedActiveTab === "projects" && (
-                        <section className="flex-1 flex flex-col min-h-[400px]">
-                            <ProjectsBurndown
-                                tasks={proServicesTasks}
-                                projectOptions={projectOptions}
+                                onCapacityGridChange={setCapacityGridState}
                             />
                         </section>
                     )}

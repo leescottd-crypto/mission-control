@@ -15,7 +15,7 @@ async function main() {
     });
     const folderlessData = await folderlessRes.json();
 
-    const lists = [];
+    const lists: Array<{ id: string; name: string }> = [];
     if (data.folders) {
         data.folders.forEach((f: any) => {
             if (f.lists) {
@@ -27,7 +27,7 @@ async function main() {
         folderlessData.lists.forEach((l: any) => lists.push({ id: l.id, name: l.name }));
     }
 
-    lists.forEach(l => console.log(`${l.id} === ${l.name}`));
+    lists.forEach((l) => console.log(`${l.id} === ${l.name}`));
 }
 
 main().catch(console.error);

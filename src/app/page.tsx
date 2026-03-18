@@ -14,7 +14,9 @@ import {
     getConsultantConfigs,
     getCapacityGridConfig,
     getConsultantConfigsForYear,
-    getCapacityGridConfigsForYear
+    getCapacityGridConfigsForYear,
+    getEditableTaskBillableRollups,
+    getTaskSidebarStructure
 } from "@/app/actions";
 
 export const dynamic = "force-dynamic";
@@ -35,7 +37,7 @@ const CANONICAL_2026_WEEK_DATA: Record<string, { totalHours: number; vsTarget: n
     W14: { totalHours: 0.0, vsTarget: -350.0, vsStretch: -400.0 },
 };
 
-export default async function DashboardPage({ searchParams }: { searchParams: { week?: string; tab?: string } }) {
+export default async function DashboardPage({ searchParams }: { searchParams: { week?: string; tab?: string; listId?: string; folderId?: string; assignee?: string } }) {
     // Await searchParams for Next.js 15 compatibility, but fallback safely
     const sp = await Promise.resolve(searchParams);
 
@@ -54,6 +56,13 @@ export default async function DashboardPage({ searchParams }: { searchParams: { 
 
     const weekStartStr = format(startMs, 'yyyy-MM-dd');
     const initialTab = String(sp?.tab || "");
+    const initialSelectedListId = typeof sp?.listId === "string" && sp.listId.trim().length > 0 ? sp.listId.trim() : null;
+    const initialSelectedFolderId = initialSelectedListId
+        ? null
+        : typeof sp?.folderId === "string" && sp.folderId.trim().length > 0
+            ? sp.folderId.trim()
+            : null;
+    const initialAssigneeFilter = typeof sp?.assignee === "string" && sp.assignee.trim().length > 0 ? sp.assignee.trim() : null;
     const previousWeekStartStr = format(addWeeks(new Date(startMs), -1), "yyyy-MM-dd");
     const activeYear = new Date(startMs).getFullYear();
     const yearStartMs = new Date(activeYear, 0, 1).getTime();
@@ -78,7 +87,9 @@ export default async function DashboardPage({ searchParams }: { searchParams: { 
         capacityGridConfigsForYear,
         previousLeadConfigs,
         previousClientConfigs,
-        previousConsultantConfigs
+        previousConsultantConfigs,
+        initialTaskBillableRollups,
+        initialSidebarStructure
     ] = await Promise.all([
         getTeamTasks(),
         getSpaceFoldersWithLists(PROFESSIONAL_SERVICES_SPACE_ID, EXCLUDED_FOLDERS),
@@ -93,6 +104,8 @@ export default async function DashboardPage({ searchParams }: { searchParams: { 
         getLeadConfigs(previousWeekStartStr),
         getClientConfigs(previousWeekStartStr),
         getConsultantConfigs(previousWeekStartStr),
+        getEditableTaskBillableRollups(weekStartStr),
+        getTaskSidebarStructure(),
     ]);
 
     const isError = !Array.isArray(initialTasks) && (initialTasks as any).error;
@@ -124,11 +137,6 @@ export default async function DashboardPage({ searchParams }: { searchParams: { 
         .sort((a, b) => a.name.localeCompare(b.name));
     const capacityGridConfig = await getCapacityGridConfig(weekStartStr, consultantRoster);
     const validYearTimeEntries = Array.isArray(yearTimeEntries) ? yearTimeEntries : [];
-    const validTimeEntries = validYearTimeEntries.filter((entry: any) => {
-        const entryStartMs = Number(entry?.start || 0);
-        return entryStartMs >= startMs && entryStartMs <= endMs;
-    });
-
     const weekConfigByStart = new Map<string, { baseTarget: number, stretchTarget: number }>();
     weekConfigsForYear.forEach((cfg: any) => {
         weekConfigByStart.set(cfg.week, {
@@ -253,10 +261,15 @@ export default async function DashboardPage({ searchParams }: { searchParams: { 
         <DashboardClient
             initialTasks={validTasks}
             initialFolders={initialFolders}
-            initialTimeEntries={validTimeEntries}
+            initialTimeEntries={validYearTimeEntries}
             isError={isError}
             weekStartStr={weekStartStr}
             initialTab={initialTab}
+            initialSelectedListId={initialSelectedListId}
+            initialSelectedFolderId={initialSelectedFolderId}
+            initialAssigneeFilter={initialAssigneeFilter}
+            initialTaskBillableRollups={initialTaskBillableRollups}
+            initialSidebarStructure={initialSidebarStructure}
             dbConfig={{
                 weekConfig,
                 weeklyTrend,

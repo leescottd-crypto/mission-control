@@ -19,6 +19,11 @@ function normalizeName(value: string) {
     return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
 }
 
+function getAllocationHours(cell: unknown) {
+    const legacyCell = cell as { hours?: number; wt?: number; wPlus?: number } | undefined;
+    return Number(legacyCell?.hours ?? Number(legacyCell?.wt ?? 0) + Number(legacyCell?.wPlus ?? 0));
+}
+
 function getFirstMonday(year: number) {
     const d = new Date(year, 0, 1);
     while (d.getDay() !== 1) d.setDate(d.getDate() + 1);
@@ -101,6 +106,7 @@ export function CapacityTrends({
     const consultantsForGrid = useMemo(() => {
         const byId = new Map<number, { key: string; id: number; name: string }>();
         consultants.forEach((c) => {
+            if (Boolean((c as any)?.removed)) return;
             const id = Number(c.id || 0);
             if (id <= 0) return;
             const name = String(c.name || "").trim() || `Consultant ${id}`;
@@ -114,36 +120,29 @@ export function CapacityTrends({
     }, [consultants]);
 
     const weeklyHoursByConsultant = useMemo(() => {
-        const map = new Map<string, { byId: Map<number, { mtHrs: number; wPlusHrs: number }>; byName: Map<string, { mtHrs: number; wPlusHrs: number }> }>();
+        const map = new Map<string, { byId: Map<number, number>; byName: Map<string, number> }>();
 
         (Array.isArray(capacityGridConfigsForYear) ? capacityGridConfigsForYear : []).forEach((weekRow) => {
             const week = String(weekRow.week || "");
             if (!weeks.includes(week)) return;
             const payload = weekRow.payload as CapacityGridPayload;
-            const resources = Array.isArray(payload?.resources) ? payload.resources : [];
+            const resources = (Array.isArray(payload?.resources) ? payload.resources : []).filter((resource: any) => !Boolean(resource?.removed));
             const rows = Array.isArray(payload?.rows) ? payload.rows : [];
 
-            const byId = new Map<number, { mtHrs: number; wPlusHrs: number }>();
-            const byName = new Map<string, { mtHrs: number; wPlusHrs: number }>();
+            const byId = new Map<number, number>();
+            const byName = new Map<string, number>();
 
             rows.forEach((row) => {
                 const allocations = row?.allocations || {};
                 resources.forEach((resource) => {
-                    const wt = Number(allocations?.[resource.id]?.wt ?? 0);
-                    const wPlus = Number(allocations?.[resource.id]?.wPlus ?? 0);
+                    const hours = getAllocationHours(allocations?.[resource.id]);
                     const consultantId = Number(resource?.consultantId ?? 0);
                     if (consultantId > 0) {
-                        const current = byId.get(consultantId) || { mtHrs: 0, wPlusHrs: 0 };
-                        current.mtHrs += wt;
-                        current.wPlusHrs += wPlus;
-                        byId.set(consultantId, current);
+                        byId.set(consultantId, Number(byId.get(consultantId) ?? 0) + hours);
                     }
                     const nameKey = normalizeName(String(resource?.name || ""));
                     if (nameKey) {
-                        const currentByName = byName.get(nameKey) || { mtHrs: 0, wPlusHrs: 0 };
-                        currentByName.mtHrs += wt;
-                        currentByName.wPlusHrs += wPlus;
-                        byName.set(nameKey, currentByName);
+                        byName.set(nameKey, Number(byName.get(nameKey) ?? 0) + hours);
                     }
                 });
             });
@@ -181,8 +180,8 @@ export function CapacityTrends({
         const hours =
             weekHours?.byId.get(consultant.id) ||
             weekHours?.byName.get(normalizeName(consultant.name)) ||
-            { mtHrs: 0, wPlusHrs: 0 };
-        const planned = Number(hours.mtHrs || 0) + Number(hours.wPlusHrs || 0);
+            0;
+        const planned = Number(hours || 0);
         const capacity = Number(
             capacityByWeekAndConsultant.get(`${week}|${consultant.key}`)
             ?? 40
@@ -203,8 +202,8 @@ export function CapacityTrends({
             const hours =
                 weekHours?.byId.get(consultant.id) ||
                 weekHours?.byName.get(normalizeName(consultant.name)) ||
-                { mtHrs: 0, wPlusHrs: 0 };
-            return sum + Number(hours.mtHrs || 0) + Number(hours.wPlusHrs || 0);
+                0;
+            return sum + Number(hours || 0);
         }, 0);
 
         const totalBillable = consultantsForGrid.reduce((sum, consultant) => {
@@ -230,8 +229,8 @@ export function CapacityTrends({
                 const hours =
                     weekHours?.byId.get(consultant.id) ||
                     weekHours?.byName.get(normalizeName(consultant.name)) ||
-                    { mtHrs: 0, wPlusHrs: 0 };
-                return sum + Number(hours.mtHrs || 0) + Number(hours.wPlusHrs || 0);
+                    0;
+                return sum + Number(hours || 0);
             }, 0);
 
             const billable = consultantsForGrid.reduce((sum, consultant) => {
@@ -337,7 +336,7 @@ export function CapacityTrends({
                         </div>
                     </div>
                     <div className="border border-border/40 rounded-lg bg-surface/20 p-3">
-                        <div className="text-[11px] uppercase text-text-muted">Planned Hours (WT+W+)</div>
+                        <div className="text-[11px] uppercase text-text-muted">Planned Hours</div>
                         <div className="text-2xl font-bold text-white mt-1">{overallForActiveWeek.totalPlanned.toFixed(1)}</div>
                     </div>
                     <div className="border border-border/40 rounded-lg bg-surface/20 p-3">

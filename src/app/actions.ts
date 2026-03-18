@@ -2,19 +2,20 @@
 
 import { prisma } from "@/lib/prisma";
 import { revalidatePath } from "next/cache";
+import { addDays } from "date-fns";
 
 export interface CapacityGridResource {
     id: string;
     name: string;
     orderIndex: number;
     consultantId?: number | null;
+    removed?: boolean;
 }
 
 export interface CapacityGridAllocation {
-    wt: number;
-    wPlus: number;
-    wtSource?: "manual" | "clickup";
-    wPlusSource?: "manual" | "clickup";
+    hours: number;
+    source?: "manual" | "clickup";
+    note?: string;
 }
 
 export interface CapacityGridRow {
@@ -42,6 +43,67 @@ export interface CapacityGridWeekRecord {
 export interface CapacityGridConsultant {
     id: number;
     name: string;
+}
+
+export interface EditableTaskSeed {
+    sourceTaskId: string;
+    subject: string;
+    description?: string;
+    assignee?: string;
+    billableHoursToday?: number;
+    week: string;
+    status: "backlog" | "open" | "closed";
+}
+
+export interface EditableTaskRecord {
+    id: string;
+    week: string;
+    scopeType: string;
+    scopeId: string;
+    sourceTaskId?: string | null;
+    subject: string;
+    description: string;
+    assignee: string;
+    billableHoursToday: number;
+    status: "backlog" | "open" | "closed";
+    position: number;
+    billableEntries: EditableTaskBillableEntryRecord[];
+}
+
+export interface EditableTaskBillableEntryRecord {
+    id: string;
+    taskId: string;
+    entryDate: string;
+    hours: number;
+    note: string;
+    createdAt: string;
+    updatedAt: string;
+}
+
+export interface EditableTaskBillableRollupRecord {
+    scopeType: string;
+    scopeId: string;
+    assignee: string;
+    hours: number;
+}
+
+export interface TaskSidebarFolderRecord {
+    id: string;
+    name: string;
+    orderIndex: number;
+}
+
+export interface TaskSidebarBoardRecord {
+    id: string;
+    name: string;
+    parentFolderId: string;
+    orderIndex: number;
+}
+
+export interface TaskSidebarStructureRecord {
+    folders: TaskSidebarFolderRecord[];
+    boards: TaskSidebarBoardRecord[];
+    hiddenBoardIds: string[];
 }
 
 const DEFAULT_CAPACITY_GRID_RESOURCES: CapacityGridResource[] = [
@@ -72,6 +134,36 @@ function normalizeFirstToken(value: string) {
 function resourceIdFromName(name: string) {
     const id = slugify(name);
     return id.length > 0 ? id : `resource-${Date.now()}`;
+}
+
+function normalizeEditableTaskStatus(value: string): "backlog" | "open" | "closed" {
+    const normalized = String(value || "").trim().toLowerCase();
+    if (normalized === "closed") return "closed";
+    if (normalized === "open") return "open";
+    return "backlog";
+}
+
+function mapEditableTaskBillableEntry(row: any): EditableTaskBillableEntryRecord {
+    return {
+        id: String(row.id),
+        taskId: String(row.taskId),
+        entryDate: String(row.entryDate ?? ""),
+        hours: Number(row.hours ?? 0),
+        note: String(row.note ?? ""),
+        createdAt: new Date(row.createdAt).toISOString(),
+        updatedAt: new Date(row.updatedAt).toISOString(),
+    };
+}
+
+function getWeekDateRange(week: string) {
+    const start = new Date(`${week}T00:00:00`);
+    const end = addDays(start, 6);
+    return {
+        start,
+        end,
+        startKey: week,
+        endKey: end.toISOString().slice(0, 10),
+    };
 }
 
 function buildResourcesFromConsultants(consultants?: CapacityGridConsultant[] | string[]): CapacityGridResource[] {
@@ -119,9 +211,22 @@ function buildResourcesFromConsultants(consultants?: CapacityGridConsultant[] | 
 function buildEmptyAllocations(resources: CapacityGridResource[]): Record<string, CapacityGridAllocation> {
     const allocations: Record<string, CapacityGridAllocation> = {};
     resources.forEach((resource) => {
-        allocations[resource.id] = { wt: 0, wPlus: 0, wtSource: "manual", wPlusSource: "manual" };
+        allocations[resource.id] = { hours: 0, source: "manual", note: "" };
     });
     return allocations;
+}
+
+function normalizeAllocationCell(cell: any): CapacityGridAllocation {
+    const rawHours = cell?.hours ?? (Number(cell?.wt ?? 0) + Number(cell?.wPlus ?? 0));
+    const hours = Number(rawHours ?? 0);
+    const source = cell?.source === "clickup" || cell?.wtSource === "clickup" || cell?.wPlusSource === "clickup"
+        ? "clickup"
+        : "manual";
+    return {
+        hours,
+        source,
+        note: String(cell?.note ?? ""),
+    };
 }
 
 function sanitizeCapacityPayload(input: any, forcedResources?: CapacityGridResource[]): CapacityGridPayload {
@@ -135,6 +240,7 @@ function sanitizeCapacityPayload(input: any, forcedResources?: CapacityGridResou
             consultantId: Number.isFinite(Number(r?.consultantId))
                 ? Number(r.consultantId)
                 : null,
+            removed: Boolean(r?.removed ?? false),
         }))
         : DEFAULT_CAPACITY_GRID_RESOURCES;
 
@@ -145,12 +251,7 @@ function sanitizeCapacityPayload(input: any, forcedResources?: CapacityGridResou
             resources.forEach((resource) => {
                 const cell = incoming[resource.id];
                 if (cell) {
-                    allocations[resource.id] = {
-                        wt: Number(cell.wt ?? 0),
-                        wPlus: Number(cell.wPlus ?? 0),
-                        wtSource: cell.wtSource === "clickup" ? "clickup" : "manual",
-                        wPlusSource: cell.wPlusSource === "clickup" ? "clickup" : "manual",
-                    };
+                    allocations[resource.id] = normalizeAllocationCell(cell);
                 }
             });
             return {
@@ -185,56 +286,33 @@ function remapCapacityPayloadToResources(payload: CapacityGridPayload, targetRes
         targetResources.forEach((target) => {
             const direct = row.allocations[target.id];
             if (direct) {
-                nextAllocations[target.id] = {
-                    wt: Number(direct.wt ?? 0),
-                    wPlus: Number(direct.wPlus ?? 0),
-                };
+                nextAllocations[target.id] = normalizeAllocationCell(direct);
                 return;
             }
             if (Number(target.consultantId) > 0) {
                 const matchByConsultantId = existingByConsultantId.get(Number(target.consultantId));
                 if (matchByConsultantId && row.allocations[matchByConsultantId.id]) {
                     const cell = row.allocations[matchByConsultantId.id];
-                    nextAllocations[target.id] = {
-                        wt: Number(cell.wt ?? 0),
-                        wPlus: Number(cell.wPlus ?? 0),
-                        wtSource: cell.wtSource === "clickup" ? "clickup" : "manual",
-                        wPlusSource: cell.wPlusSource === "clickup" ? "clickup" : "manual",
-                    };
+                    nextAllocations[target.id] = normalizeAllocationCell(cell);
                     return;
                 }
             }
             const matchByNorm = existingByNorm.get(normalizeName(target.name));
             if (matchByNorm && row.allocations[matchByNorm.id]) {
                 const cell = row.allocations[matchByNorm.id];
-                    nextAllocations[target.id] = {
-                        wt: Number(cell.wt ?? 0),
-                        wPlus: Number(cell.wPlus ?? 0),
-                        wtSource: cell.wtSource === "clickup" ? "clickup" : "manual",
-                        wPlusSource: cell.wPlusSource === "clickup" ? "clickup" : "manual",
-                    };
-                    return;
-                }
+                nextAllocations[target.id] = normalizeAllocationCell(cell);
+                return;
+            }
             const matchByFirstToken = existingByFirstToken.get(normalizeFirstToken(target.name));
             if (matchByFirstToken && row.allocations[matchByFirstToken.id]) {
                 const cell = row.allocations[matchByFirstToken.id];
-                    nextAllocations[target.id] = {
-                        wt: Number(cell.wt ?? 0),
-                        wPlus: Number(cell.wPlus ?? 0),
-                        wtSource: cell.wtSource === "clickup" ? "clickup" : "manual",
-                        wPlusSource: cell.wPlusSource === "clickup" ? "clickup" : "manual",
-                    };
-                    return;
-                }
+                nextAllocations[target.id] = normalizeAllocationCell(cell);
+                return;
+            }
             const matchById = existingById.get(target.id);
             if (matchById && row.allocations[matchById.id]) {
                 const cell = row.allocations[matchById.id];
-                nextAllocations[target.id] = {
-                    wt: Number(cell.wt ?? 0),
-                    wPlus: Number(cell.wPlus ?? 0),
-                    wtSource: cell.wtSource === "clickup" ? "clickup" : "manual",
-                    wPlusSource: cell.wPlusSource === "clickup" ? "clickup" : "manual",
-                };
+                nextAllocations[target.id] = normalizeAllocationCell(cell);
             }
         });
 
@@ -246,6 +324,55 @@ function remapCapacityPayloadToResources(payload: CapacityGridPayload, targetRes
 
     return {
         resources: targetResources,
+        rows,
+    };
+}
+
+function mergeCapacityPayloadWithRoster(payload: CapacityGridPayload, rosterResources: CapacityGridResource[]): CapacityGridPayload {
+    const existingResources = Array.isArray(payload?.resources) ? payload.resources : [];
+    const existingByConsultantId = new Map(
+        existingResources
+            .filter((r) => Number.isFinite(Number(r.consultantId)) && Number(r.consultantId) > 0)
+            .map((r) => [Number(r.consultantId), r])
+    );
+    const existingByNorm = new Map(existingResources.map((r) => [normalizeName(r.name), r]));
+    const existingByFirstToken = new Map(existingResources.map((r) => [normalizeFirstToken(r.name), r]));
+
+    const additions = rosterResources.filter((resource) => {
+        const consultantId = Number(resource.consultantId ?? 0);
+        if (consultantId > 0 && existingByConsultantId.has(consultantId)) return false;
+        const norm = normalizeName(resource.name);
+        if (norm && existingByNorm.has(norm)) return false;
+        const first = normalizeFirstToken(resource.name);
+        if (first && existingByFirstToken.has(first)) return false;
+        return true;
+    });
+
+    if (additions.length === 0) return payload;
+
+    const resources = [
+        ...existingResources,
+        ...additions.map((resource, idx) => ({
+            ...resource,
+            orderIndex: existingResources.length + idx,
+        })),
+    ];
+
+    const rows = payload.rows.map((row) => {
+        const nextAllocations = { ...(row.allocations || {}) };
+        additions.forEach((resource) => {
+            if (!nextAllocations[resource.id]) {
+                nextAllocations[resource.id] = { hours: 0, source: "manual", note: "" };
+            }
+        });
+        return {
+            ...row,
+            allocations: nextAllocations,
+        };
+    });
+
+    return {
+        resources,
         rows,
     };
 }
@@ -529,8 +656,10 @@ export async function getCapacityGridConfig(
             resources: JSON.parse(existing.resourcesJson || "[]"),
             rows: JSON.parse(existing.rowsJson || "[]"),
         });
-        const aligned = consultants && consultants.length > 0
+        const aligned = parsed.resources.length === 0 && consultants && consultants.length > 0
             ? remapCapacityPayloadToResources(parsed, rosterResources)
+            : consultants && consultants.length > 0
+            ? mergeCapacityPayloadWithRoster(parsed, rosterResources)
             : parsed;
         const wkMaxApplied = await applyInitialWkMaxFromTarget(week, aligned);
         const teamApplied = await applyInitialTeamFromClientConfig(week, wkMaxApplied.payload);
@@ -614,5 +743,644 @@ export async function updateCapacityGridConfig(week: string, payload: CapacityGr
             rowsJson: JSON.stringify(sanitized.rows),
         },
     });
+    revalidatePath("/");
+}
+
+export async function getEditableTasks(
+    week: string,
+    scopeType: string,
+    scopeId: string,
+    seedTasks: EditableTaskSeed[] = []
+): Promise<EditableTaskRecord[]> {
+    const editableTaskModel = (prisma as any).editableTask;
+    if (!editableTaskModel) return [];
+
+    const normalizedScopeType = String(scopeType || "all");
+    const normalizedScopeId = String(scopeId || "all");
+
+    const existingRows = await editableTaskModel.findMany({
+        where: {
+            week,
+            scopeType: normalizedScopeType,
+            scopeId: normalizedScopeId,
+        },
+        include: {
+            billableEntries: {
+                orderBy: [
+                    { entryDate: "desc" },
+                    { createdAt: "desc" },
+                ],
+            },
+        },
+        orderBy: [
+            { status: "asc" },
+            { position: "asc" },
+            { createdAt: "asc" },
+        ],
+    });
+
+    const filteredSeedTasks = seedTasks.filter((task) => String(task?.week ?? "") === week);
+    const allowedSourceTaskIds = new Set(
+        filteredSeedTasks
+            .map((task) => String(task?.sourceTaskId ?? "").trim())
+            .filter(Boolean)
+    );
+
+    const stalePlaceholderIds = existingRows
+        .filter((row: any) => {
+            const sourceTaskId = String(row?.sourceTaskId ?? "").trim();
+            return sourceTaskId && !allowedSourceTaskIds.has(sourceTaskId);
+        })
+        .map((row: any) => String(row.id));
+
+    if (stalePlaceholderIds.length > 0) {
+        await editableTaskModel.deleteMany({
+            where: {
+                id: {
+                    in: stalePlaceholderIds,
+                },
+            },
+        });
+    }
+
+    const refreshedExistingRows = stalePlaceholderIds.length > 0
+        ? await editableTaskModel.findMany({
+            where: {
+                week,
+                scopeType: normalizedScopeType,
+                scopeId: normalizedScopeId,
+            },
+            include: {
+                billableEntries: {
+                    orderBy: [
+                        { entryDate: "desc" },
+                        { createdAt: "desc" },
+                    ],
+                },
+            },
+            orderBy: [
+                { status: "asc" },
+                { position: "asc" },
+                { createdAt: "asc" },
+            ],
+        })
+        : existingRows;
+
+    const positionByStatus = new Map<string, number>();
+    refreshedExistingRows.forEach((row: any) => {
+        const status = normalizeEditableTaskStatus(String(row?.status ?? "backlog"));
+        positionByStatus.set(status, Math.max(Number(positionByStatus.get(status) ?? 0), Number(row?.position ?? 0)));
+    });
+
+    const refreshedExistingBySourceTaskId = new Map(
+        refreshedExistingRows
+            .map((row: any) => [String(row?.sourceTaskId ?? "").trim(), row] as const)
+            .filter((entry: readonly [string, any]) => Boolean(entry[0]))
+    );
+
+    for (const task of filteredSeedTasks) {
+        const sourceTaskId = String(task?.sourceTaskId ?? "").trim();
+        const status = normalizeEditableTaskStatus(String(task?.status ?? "backlog"));
+        if (!sourceTaskId) continue;
+
+        const existingRow: any = refreshedExistingBySourceTaskId.get(sourceTaskId);
+        if (existingRow) {
+            const updateData: Record<string, unknown> = {};
+            if (String(existingRow.subject ?? "") !== String(task?.subject ?? "Untitled Task")) {
+                updateData.subject = String(task?.subject ?? "Untitled Task");
+            }
+            if (String(existingRow.assignee ?? "") !== String(task?.assignee ?? "")) {
+                updateData.assignee = String(task?.assignee ?? "");
+            }
+            if (Number(existingRow.billableHoursToday ?? 0) !== Number(task?.billableHoursToday ?? 0)) {
+                updateData.billableHoursToday = Number(task?.billableHoursToday ?? 0);
+            }
+            if (normalizeEditableTaskStatus(String(existingRow?.status ?? "backlog")) !== status) {
+                updateData.status = status;
+            }
+            if (String(existingRow.week ?? "") !== week) {
+                updateData.week = week;
+            }
+
+            if (Object.keys(updateData).length > 0) {
+                await editableTaskModel.update({
+                    where: { id: String(existingRow.id) },
+                    data: updateData,
+                });
+            }
+            continue;
+        }
+
+        const nextPosition = Number(positionByStatus.get(status) ?? 0) + 1;
+        positionByStatus.set(status, nextPosition);
+
+        await editableTaskModel.create({
+            data: {
+                week,
+                scopeType: normalizedScopeType,
+                scopeId: normalizedScopeId,
+                sourceTaskId,
+                subject: String(task?.subject ?? "Untitled Task"),
+                description: String(task?.description ?? ""),
+                assignee: String(task?.assignee ?? ""),
+                billableHoursToday: Number(task?.billableHoursToday ?? 0),
+                status,
+                position: nextPosition,
+            },
+        });
+    }
+
+    const rows = await editableTaskModel.findMany({
+        where: {
+            week,
+            scopeType: normalizedScopeType,
+            scopeId: normalizedScopeId,
+        },
+        include: {
+            billableEntries: {
+                orderBy: [
+                    { entryDate: "desc" },
+                    { createdAt: "desc" },
+                ],
+            },
+        },
+        orderBy: [
+            { status: "asc" },
+            { position: "asc" },
+            { createdAt: "asc" },
+        ],
+    });
+
+    return rows.map((row: any) => ({
+        id: String(row.id),
+        week: String(row.week),
+        scopeType: String(row.scopeType),
+        scopeId: String(row.scopeId),
+        sourceTaskId: row.sourceTaskId ? String(row.sourceTaskId) : null,
+        subject: String(row.subject ?? ""),
+        description: String(row.description ?? ""),
+        assignee: String(row.assignee ?? ""),
+        billableHoursToday: Number(row.billableHoursToday ?? 0),
+        status: normalizeEditableTaskStatus(String(row.status ?? "backlog")),
+        position: Number(row.position ?? 0),
+        billableEntries: Array.isArray(row.billableEntries)
+            ? row.billableEntries.map(mapEditableTaskBillableEntry)
+            : [],
+    }));
+}
+
+export async function createEditableTask(input: {
+    week: string;
+    scopeType: string;
+    scopeId: string;
+    subject: string;
+    description?: string;
+    assignee?: string;
+    billableHoursToday?: number;
+    status?: "backlog" | "open" | "closed";
+}) {
+    const editableTaskModel = (prisma as any).editableTask;
+    if (!editableTaskModel) return null;
+
+    const status = normalizeEditableTaskStatus(String(input.status ?? "backlog"));
+    const lastInStatus = await editableTaskModel.findFirst({
+        where: {
+            week: String(input.week),
+            scopeType: String(input.scopeType),
+            scopeId: String(input.scopeId),
+            status,
+        },
+        orderBy: {
+            position: "desc",
+        },
+    });
+
+    const created = await editableTaskModel.create({
+        data: {
+            week: String(input.week),
+            scopeType: String(input.scopeType),
+            scopeId: String(input.scopeId),
+            subject: String(input.subject || "Untitled Task"),
+            description: String(input.description ?? ""),
+            assignee: String(input.assignee ?? ""),
+            billableHoursToday: Number(input.billableHoursToday ?? 0),
+            status,
+            position: Number(lastInStatus?.position ?? 0) + 1,
+        },
+    });
+
+    revalidatePath("/");
+    return {
+        id: String(created.id),
+        week: String(created.week),
+        scopeType: String(created.scopeType),
+        scopeId: String(created.scopeId),
+        sourceTaskId: created.sourceTaskId ? String(created.sourceTaskId) : null,
+        subject: String(created.subject ?? ""),
+        description: String(created.description ?? ""),
+        assignee: String(created.assignee ?? ""),
+        billableHoursToday: Number(created.billableHoursToday ?? 0),
+        status: normalizeEditableTaskStatus(String(created.status ?? "backlog")),
+        position: Number(created.position ?? 0),
+        billableEntries: [],
+    } satisfies EditableTaskRecord;
+}
+
+export async function updateEditableTask(
+    taskId: string,
+    data: Partial<{
+        week: string;
+        subject: string;
+        description: string;
+        assignee: string;
+        billableHoursToday: number;
+        status: "backlog" | "open" | "closed";
+        position: number;
+    }>
+) {
+    const editableTaskModel = (prisma as any).editableTask;
+    if (!editableTaskModel) return;
+
+    const updateData: Record<string, unknown> = {};
+    if (typeof data.week === "string") updateData.week = data.week;
+    if (typeof data.subject === "string") updateData.subject = data.subject;
+    if (typeof data.description === "string") updateData.description = data.description;
+    if (typeof data.assignee === "string") updateData.assignee = data.assignee;
+    if (typeof data.billableHoursToday === "number" && Number.isFinite(data.billableHoursToday)) updateData.billableHoursToday = data.billableHoursToday;
+    if (typeof data.status === "string") updateData.status = normalizeEditableTaskStatus(data.status);
+    if (typeof data.position === "number" && Number.isFinite(data.position)) updateData.position = data.position;
+
+    await editableTaskModel.update({
+        where: { id: taskId },
+        data: updateData,
+    });
+
+    revalidatePath("/");
+}
+
+export async function deleteEditableTask(taskId: string) {
+    const editableTaskModel = (prisma as any).editableTask;
+    if (!editableTaskModel) return;
+
+    await editableTaskModel.delete({
+        where: { id: taskId },
+    });
+
+    revalidatePath("/");
+}
+
+export async function addEditableTaskBillableEntry(input: {
+    taskId: string;
+    entryDate: string;
+    hours: number;
+    note?: string;
+}) {
+    const taskBillableEntryModel = (prisma as any).taskBillableEntry;
+    const editableTaskModel = (prisma as any).editableTask;
+    if (!taskBillableEntryModel || !editableTaskModel) return null;
+
+    const taskId = String(input.taskId || "").trim();
+    const entryDate = String(input.entryDate || "").trim();
+    const hours = Number(input.hours ?? 0);
+    if (!taskId || !entryDate || !Number.isFinite(hours)) return null;
+
+    const created = await taskBillableEntryModel.create({
+        data: {
+            taskId,
+            entryDate,
+            hours,
+            note: String(input.note ?? ""),
+        },
+    });
+
+    const entryDatePrefix = entryDate.slice(0, 10);
+    const todayHours = await taskBillableEntryModel.aggregate({
+        where: {
+            taskId,
+            entryDate: entryDatePrefix,
+        },
+        _sum: {
+            hours: true,
+        },
+    });
+
+    await editableTaskModel.update({
+        where: { id: taskId },
+        data: {
+            billableHoursToday: Number(todayHours?._sum?.hours ?? 0),
+        },
+    });
+
+    revalidatePath("/");
+    return mapEditableTaskBillableEntry(created);
+}
+
+export async function deleteEditableTaskBillableEntry(entryId: string) {
+    const taskBillableEntryModel = (prisma as any).taskBillableEntry;
+    const editableTaskModel = (prisma as any).editableTask;
+    if (!taskBillableEntryModel || !editableTaskModel) return;
+
+    const existing = await taskBillableEntryModel.findUnique({
+        where: { id: String(entryId) },
+    });
+    if (!existing) return;
+
+    await taskBillableEntryModel.delete({
+        where: { id: String(entryId) },
+    });
+
+    const remainingForDay = await taskBillableEntryModel.aggregate({
+        where: {
+            taskId: String(existing.taskId),
+            entryDate: String(existing.entryDate),
+        },
+        _sum: {
+            hours: true,
+        },
+    });
+
+    await editableTaskModel.update({
+        where: { id: String(existing.taskId) },
+        data: {
+            billableHoursToday: Number(remainingForDay?._sum?.hours ?? 0),
+        },
+    });
+
+    revalidatePath("/");
+}
+
+export async function getEditableTaskBillableRollups(week: string): Promise<EditableTaskBillableRollupRecord[]> {
+    const editableTaskModel = (prisma as any).editableTask;
+    if (!editableTaskModel) return [];
+
+    const range = getWeekDateRange(week);
+    const rows = await editableTaskModel.findMany({
+        include: {
+            billableEntries: {
+                where: {
+                    entryDate: {
+                        gte: range.startKey,
+                        lte: range.endKey,
+                    },
+                },
+            },
+        },
+    });
+
+    const rollups = new Map<string, EditableTaskBillableRollupRecord>();
+    rows.forEach((row: any) => {
+        const assignee = String(row?.assignee ?? "").trim();
+        if (!assignee) return;
+
+        const hours = Array.isArray(row?.billableEntries)
+            ? row.billableEntries.reduce((sum: number, entry: any) => sum + Number(entry?.hours ?? 0), 0)
+            : 0;
+        if (hours <= 0) return;
+
+        const scopeType = String(row?.scopeType ?? "");
+        const scopeId = String(row?.scopeId ?? "");
+        const key = `${scopeType}|${scopeId}|${normalizeName(assignee)}`;
+        const current = rollups.get(key);
+        if (current) {
+            current.hours += hours;
+            return;
+        }
+        rollups.set(key, {
+            scopeType,
+            scopeId,
+            assignee,
+            hours,
+        });
+    });
+
+    return Array.from(rollups.values()).map((row) => ({
+        ...row,
+        hours: Number(row.hours.toFixed(2)),
+    }));
+}
+
+export async function getTaskSidebarStructure(): Promise<TaskSidebarStructureRecord> {
+    const taskSidebarFolderModel = (prisma as any).taskSidebarFolder;
+    const taskSidebarBoardModel = (prisma as any).taskSidebarBoard;
+    const taskSidebarHiddenBoardModel = (prisma as any).taskSidebarHiddenBoard;
+    if (!taskSidebarFolderModel || !taskSidebarBoardModel) {
+        return { folders: [], boards: [], hiddenBoardIds: [] };
+    }
+
+    const [folders, boards, hiddenBoards] = await Promise.all([
+        taskSidebarFolderModel.findMany({
+            orderBy: [
+                { orderIndex: "asc" },
+                { createdAt: "asc" },
+            ],
+        }),
+        taskSidebarBoardModel.findMany({
+            orderBy: [
+                { parentFolderId: "asc" },
+                { orderIndex: "asc" },
+                { createdAt: "asc" },
+            ],
+        }),
+        taskSidebarHiddenBoardModel?.findMany?.({
+            orderBy: { createdAt: "asc" },
+        }) ?? [],
+    ]);
+
+    return {
+        folders: folders.map((row: any) => ({
+            id: String(row.id),
+            name: String(row.name ?? ""),
+            orderIndex: Number(row.orderIndex ?? 0),
+        })),
+        boards: boards.map((row: any) => ({
+            id: String(row.id),
+            name: String(row.name ?? ""),
+            parentFolderId: String(row.parentFolderId ?? ""),
+            orderIndex: Number(row.orderIndex ?? 0),
+        })),
+        hiddenBoardIds: hiddenBoards.map((row: any) => String(row.boardId ?? "")).filter(Boolean),
+    };
+}
+
+export async function createTaskSidebarFolder(name: string) {
+    const taskSidebarFolderModel = (prisma as any).taskSidebarFolder;
+    if (!taskSidebarFolderModel) return null;
+
+    const trimmed = String(name || "").trim();
+    if (!trimmed) return null;
+
+    const lastFolder = await taskSidebarFolderModel.findFirst({
+        orderBy: { orderIndex: "desc" },
+    });
+
+    const created = await taskSidebarFolderModel.create({
+        data: {
+            name: trimmed,
+            orderIndex: Number(lastFolder?.orderIndex ?? 0) + 1,
+        },
+    });
+
+    revalidatePath("/");
+    return {
+        id: String(created.id),
+        name: String(created.name ?? ""),
+        orderIndex: Number(created.orderIndex ?? 0),
+    } satisfies TaskSidebarFolderRecord;
+}
+
+export async function createTaskSidebarBoard(input: { parentFolderId: string; name: string }) {
+    const taskSidebarBoardModel = (prisma as any).taskSidebarBoard;
+    if (!taskSidebarBoardModel) return null;
+
+    const parentFolderId = String(input.parentFolderId || "").trim();
+    const trimmed = String(input.name || "").trim();
+    if (!parentFolderId || !trimmed) return null;
+
+    const lastBoard = await taskSidebarBoardModel.findFirst({
+        where: { parentFolderId },
+        orderBy: { orderIndex: "desc" },
+    });
+
+    const created = await taskSidebarBoardModel.create({
+        data: {
+            parentFolderId,
+            name: trimmed,
+            orderIndex: Number(lastBoard?.orderIndex ?? 0) + 1,
+        },
+    });
+
+    revalidatePath("/");
+    return {
+        id: String(created.id),
+        name: String(created.name ?? ""),
+        parentFolderId: String(created.parentFolderId ?? ""),
+        orderIndex: Number(created.orderIndex ?? 0),
+    } satisfies TaskSidebarBoardRecord;
+}
+
+export async function deleteTaskSidebarBoard(boardId: string) {
+    const taskSidebarBoardModel = (prisma as any).taskSidebarBoard;
+    const editableTaskModel = (prisma as any).editableTask;
+    const taskBillableEntryModel = (prisma as any).taskBillableEntry;
+    const taskSidebarHiddenBoardModel = (prisma as any).taskSidebarHiddenBoard;
+    if (!taskSidebarBoardModel || !editableTaskModel || !taskBillableEntryModel) return;
+
+    const existingBoard = await taskSidebarBoardModel.findUnique({
+        where: { id: String(boardId) },
+    });
+    if (!existingBoard) return;
+
+    const boardTasks = await editableTaskModel.findMany({
+        where: {
+            scopeType: "list",
+            scopeId: String(boardId),
+        },
+        select: { id: true },
+    });
+
+    const taskIds = boardTasks.map((task: any) => String(task.id));
+    if (taskIds.length > 0) {
+        await taskBillableEntryModel.deleteMany({
+            where: {
+                taskId: {
+                    in: taskIds,
+                },
+            },
+        });
+        await editableTaskModel.deleteMany({
+            where: {
+                id: {
+                    in: taskIds,
+                },
+            },
+        });
+    }
+
+    await taskSidebarBoardModel.delete({
+        where: { id: String(boardId) },
+    });
+
+    if (taskSidebarHiddenBoardModel) {
+        await taskSidebarHiddenBoardModel.deleteMany({
+            where: { boardId: String(boardId) },
+        });
+    }
+
+    revalidatePath("/");
+}
+
+export async function hideTaskSidebarBoard(boardId: string) {
+    const taskSidebarHiddenBoardModel = (prisma as any).taskSidebarHiddenBoard;
+    if (!taskSidebarHiddenBoardModel) return;
+
+    const trimmed = String(boardId || "").trim();
+    if (!trimmed) return;
+
+    await taskSidebarHiddenBoardModel.upsert({
+        where: { boardId: trimmed },
+        update: {},
+        create: {
+            boardId: trimmed,
+        },
+    });
+
+    revalidatePath("/");
+}
+
+export async function deleteTaskSidebarFolder(folderId: string) {
+    const taskSidebarFolderModel = (prisma as any).taskSidebarFolder;
+    const taskSidebarBoardModel = (prisma as any).taskSidebarBoard;
+    const editableTaskModel = (prisma as any).editableTask;
+    const taskBillableEntryModel = (prisma as any).taskBillableEntry;
+    if (!taskSidebarFolderModel || !taskSidebarBoardModel || !editableTaskModel || !taskBillableEntryModel) return;
+
+    const folderBoards = await taskSidebarBoardModel.findMany({
+        where: { parentFolderId: String(folderId) },
+        select: { id: true },
+    });
+    const boardIds = folderBoards.map((board: any) => String(board.id));
+
+    const folderTasks = await editableTaskModel.findMany({
+        where: {
+            OR: [
+                { scopeType: "folder", scopeId: String(folderId) },
+                ...(boardIds.length > 0 ? [{ scopeType: "list", scopeId: { in: boardIds } }] : []),
+            ],
+        },
+        select: { id: true },
+    });
+    const taskIds = folderTasks.map((task: any) => String(task.id));
+
+    if (taskIds.length > 0) {
+        await taskBillableEntryModel.deleteMany({
+            where: {
+                taskId: {
+                    in: taskIds,
+                },
+            },
+        });
+        await editableTaskModel.deleteMany({
+            where: {
+                id: {
+                    in: taskIds,
+                },
+            },
+        });
+    }
+
+    if (boardIds.length > 0) {
+        await taskSidebarBoardModel.deleteMany({
+            where: {
+                id: {
+                    in: boardIds,
+                },
+            },
+        });
+    }
+
+    await taskSidebarFolderModel.delete({
+        where: { id: String(folderId) },
+    });
+
     revalidatePath("/");
 }
