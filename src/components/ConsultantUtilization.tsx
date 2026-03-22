@@ -3,26 +3,36 @@
 import { useEffect, useMemo, useRef, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { addDays, addWeeks, format, startOfWeek, subWeeks } from "date-fns";
-import { ChevronLeft, ChevronRight, RotateCcw, Trash2, Users, X } from "lucide-react";
-import { updateConsultantConfig, updateCapacityGridConfig, CapacityGridPayload } from "@/app/actions";
+import { ChevronLeft, ChevronRight, Copy, Plus, RotateCcw, Trash2, Users, X } from "lucide-react";
+import { copyConsultantUtilizationFromPriorWeek, createConsultant, updateConsultantConfig, updateCapacityGridConfig, CapacityGridPayload } from "@/app/actions";
 import { cn } from "@/lib/utils";
 
 interface ConsultantUtilizationProps {
     activeWeekStr: string;
     consultants: Array<{ id: number; name: string }>;
+    consultantDirectory?: Array<{ id: number; name: string; firstName?: string; lastName?: string; email?: string; source?: string }>;
     consultantConfigsById: Record<number, { maxCapacity: number; billableCapacity: number; notes: string }>;
     capacityGrid: CapacityGridPayload;
     onConsultantConfigChange?: (
         consultantId: number,
         patch: Partial<{ maxCapacity: number; billableCapacity: number; notes: string }>
     ) => void;
+    onConsultantConfigReplace?: (nextConfigs: Record<number, { maxCapacity: number; billableCapacity: number; notes: string }>) => void;
     onCapacityGridChange?: (nextGrid: CapacityGridPayload) => void;
+    onNavigateWeek?: (nextWeek: string) => void;
+    isWeekLoading?: boolean;
 }
 
 type RosterConfirmState = {
     resourceId: string;
     consultantName: string;
     action: "hide" | "reinstate";
+};
+
+type AddConsultantFormState = {
+    firstName: string;
+    lastName: string;
+    email: string;
 };
 
 function normalizeName(value: string) {
@@ -37,18 +47,31 @@ function getAllocationHours(cell: unknown) {
 export function ConsultantUtilization({
     activeWeekStr,
     consultants,
+    consultantDirectory = [],
     consultantConfigsById,
     capacityGrid,
     onConsultantConfigChange,
+    onConsultantConfigReplace,
     onCapacityGridChange,
+    onNavigateWeek,
+    isWeekLoading = false,
 }: ConsultantUtilizationProps) {
     const router = useRouter();
     const [isPending, startTransition] = useTransition();
+    const [isCreatingConsultant, startCreateConsultantTransition] = useTransition();
     const [isWeekNavLocked, setIsWeekNavLocked] = useState(false);
     const [activeRosterTab, setActiveRosterTab] = useState<"active" | "removed">("active");
     const [rosterConfirm, setRosterConfirm] = useState<RosterConfirmState | null>(null);
+    const [isAddConsultantOpen, setIsAddConsultantOpen] = useState(false);
+    const [addConsultantError, setAddConsultantError] = useState("");
+    const [addConsultantForm, setAddConsultantForm] = useState<AddConsultantFormState>({
+        firstName: "",
+        lastName: "",
+        email: "",
+    });
     const navUnlockTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const activeWeekDate = new Date(activeWeekStr + "T00:00:00");
+    const isNavigationBlocked = !onNavigateWeek && (isWeekNavLocked || isWeekLoading);
     const currentWeekStart = startOfWeek(new Date(), { weekStartsOn: 1 });
     const isPastWeek = activeWeekStr < format(currentWeekStart, "yyyy-MM-dd");
     const isCurrentWeek = activeWeekStr === format(currentWeekStart, "yyyy-MM-dd");
@@ -58,18 +81,22 @@ export function ConsultantUtilization({
 
     const weekParamFor = (nextDate: Date) => `/?week=${format(nextDate, "yyyy-MM-dd")}&tab=consultant-utilization`;
     const navigateToWeek = (nextDate: Date | null) => {
-        if (isWeekNavLocked) return;
+        if (isNavigationBlocked) return;
         const currentWeekStr = format(startOfWeek(new Date(), { weekStartsOn: 1 }), "yyyy-MM-dd");
         if (nextDate === null && activeWeekStr === currentWeekStr) return;
         if (nextDate && format(nextDate, "yyyy-MM-dd") === activeWeekStr) return;
 
         const href = nextDate ? weekParamFor(nextDate) : "/?tab=consultant-utilization";
-        setIsWeekNavLocked(true);
-        router.push(href);
-        navUnlockTimerRef.current = setTimeout(() => {
-            setIsWeekNavLocked(false);
-            navUnlockTimerRef.current = null;
-        }, 500);
+        if (onNavigateWeek) {
+            onNavigateWeek(nextDate ? format(nextDate, "yyyy-MM-dd") : currentWeekStr);
+        } else {
+            setIsWeekNavLocked(true);
+            router.push(href);
+            navUnlockTimerRef.current = setTimeout(() => {
+                setIsWeekNavLocked(false);
+                navUnlockTimerRef.current = null;
+            }, 500);
+        }
     };
     const handlePrevWeek = () => {
         navigateToWeek(subWeeks(activeWeekDate, 1));
@@ -95,15 +122,34 @@ export function ConsultantUtilization({
         };
     }, []);
 
+    const consultantDirectoryById = useMemo(() => {
+        const byId = new Map<number, { id: number; name: string; firstName?: string; lastName?: string; email?: string; source?: string }>();
+        consultantDirectory.forEach((consultant) => {
+            const consultantId = Number(consultant?.id ?? 0);
+            const consultantName = String(consultant?.name ?? "").trim();
+            if (!Number.isFinite(consultantId) || consultantId === 0 || !consultantName) return;
+            byId.set(consultantId, {
+                id: consultantId,
+                name: consultantName,
+                firstName: String(consultant?.firstName ?? "").trim(),
+                lastName: String(consultant?.lastName ?? "").trim(),
+                email: String(consultant?.email ?? "").trim(),
+                source: String(consultant?.source ?? "manual"),
+            });
+        });
+        return byId;
+    }, [consultantDirectory]);
+
     const consultantsForDisplay = useMemo(() => {
         const resources = Array.isArray(capacityGrid?.resources) ? capacityGrid.resources : [];
         if (resources.length > 0) {
             return resources
                 .map((resource: any, idx: number) => ({
                     id: Number(resource?.consultantId ?? -(idx + 1)),
-                    name: String(resource?.name ?? "").trim(),
+                    name: String(resource?.name ?? "").trim() || consultantDirectoryById.get(Number(resource?.consultantId ?? 0))?.name || "",
                     resourceId: String(resource?.id ?? `resource-${idx + 1}`),
                     removed: Boolean(resource?.removed ?? false),
+                    email: consultantDirectoryById.get(Number(resource?.consultantId ?? 0))?.email || "",
                 }))
                 .filter((consultant) => consultant.name.length > 0)
                 .sort((a, b) => a.name.localeCompare(b.name));
@@ -116,8 +162,9 @@ export function ConsultantUtilization({
                 ...consultant,
                 resourceId: "",
                 removed: false,
+                email: consultantDirectoryById.get(Number(consultant.id ?? 0))?.email || "",
             }));
-    }, [capacityGrid?.resources, consultants]);
+    }, [capacityGrid?.resources, consultantDirectoryById, consultants]);
 
     const activeConsultants = useMemo(
         () => consultantsForDisplay.filter((consultant) => !consultant.removed),
@@ -263,6 +310,91 @@ export function ConsultantUtilization({
         setRosterConfirm(null);
     };
 
+    const closeAddConsultantModal = () => {
+        setIsAddConsultantOpen(false);
+        setAddConsultantError("");
+        setAddConsultantForm({
+            firstName: "",
+            lastName: "",
+            email: "",
+        });
+    };
+
+    const handleAddConsultant = () => {
+        setAddConsultantError("");
+
+        startCreateConsultantTransition(async () => {
+            try {
+                const created = await createConsultant(addConsultantForm);
+
+                onConsultantConfigChange?.(created.id, {
+                    maxCapacity: 40,
+                    billableCapacity: 40,
+                    notes: "",
+                });
+
+                await updateConsultantConfig(activeWeekStr, created.id, {
+                    maxCapacity: 40,
+                    billableCapacity: 40,
+                    notes: "",
+                });
+
+                const existingResources = Array.isArray(capacityGrid?.resources) ? capacityGrid.resources : [];
+                const alreadyExists = existingResources.some((resource: any) => Number(resource?.consultantId ?? 0) === created.id);
+                const newResource = {
+                    id: `consultant-${Math.abs(created.id)}`,
+                    name: created.fullName,
+                    orderIndex: existingResources.length,
+                    consultantId: created.id,
+                    removed: false,
+                };
+                const nextResources = (alreadyExists ? existingResources : [...existingResources, newResource]).map((resource: any, idx: number) => ({
+                    ...resource,
+                    orderIndex: idx,
+                }));
+                const nextRows = (Array.isArray(capacityGrid?.rows) ? capacityGrid.rows : []).map((row: any) => ({
+                    ...row,
+                    allocations: alreadyExists
+                        ? row.allocations
+                        : {
+                            ...(row.allocations ?? {}),
+                            [newResource.id]: { hours: 0, source: "manual", note: "" },
+                        },
+                }));
+
+                persistCapacityGrid({
+                    resources: nextResources,
+                    rows: nextRows,
+                });
+
+                closeAddConsultantModal();
+            } catch (error: any) {
+                setAddConsultantError(String(error?.message || "Unable to add consultant right now."));
+            }
+        });
+    };
+
+    const handleCopyPriorWeek = () => {
+        startTransition(async () => {
+            const copied = await copyConsultantUtilizationFromPriorWeek(
+                activeWeekStr,
+                consultants.map((consultant) => ({ id: consultant.id, name: consultant.name }))
+            );
+            const nextConfigs = copied.consultantConfigs.reduce((acc, config) => {
+                acc[config.consultantId] = {
+                    maxCapacity: config.maxCapacity,
+                    billableCapacity: config.billableCapacity,
+                    notes: config.notes,
+                };
+                return acc;
+            }, {} as Record<number, { maxCapacity: number; billableCapacity: number; notes: string }>);
+            if (Object.keys(nextConfigs).length > 0) {
+                onConsultantConfigReplace?.(nextConfigs);
+            }
+            onCapacityGridChange?.(copied.capacityGrid);
+        });
+    };
+
     return (
         <>
         <section className="flex flex-col gap-4">
@@ -275,7 +407,7 @@ export function ConsultantUtilization({
                     <div className="flex items-center rounded-md border border-border/70 overflow-hidden bg-surface/20">
                         <button
                             onClick={handlePrevWeek}
-                            disabled={isWeekNavLocked}
+                            disabled={isNavigationBlocked}
                             className="h-9 w-9 flex items-center justify-center text-text-muted hover:text-white hover:bg-surface-hover transition-colors border-r border-border/70"
                             aria-label="Previous week"
                         >
@@ -287,7 +419,7 @@ export function ConsultantUtilization({
                         </div>
                         <button
                             onClick={handleNextWeek}
-                            disabled={isWeekNavLocked}
+                            disabled={isNavigationBlocked}
                             className="h-9 w-9 flex items-center justify-center text-text-muted hover:text-white hover:bg-surface-hover transition-colors border-l border-border/70"
                             aria-label="Next week"
                         >
@@ -296,7 +428,7 @@ export function ConsultantUtilization({
                     </div>
                     <button
                         onClick={handleCurrentWeek}
-                        disabled={isWeekNavLocked}
+                        disabled={isNavigationBlocked}
                         className={cn(
                             "h-9 px-3 rounded-md border border-border/70 text-xs font-semibold transition-colors",
                             isCurrentWeek ? "text-white bg-surface/50" : "text-text-muted hover:text-white hover:bg-surface-hover"
@@ -306,7 +438,9 @@ export function ConsultantUtilization({
                     </button>
                     <span className="text-xs text-text-muted">{weekLabel}</span>
                 </div>
-                <span className="text-[11px] text-text-muted">{isPending ? "Saving..." : "Synced with capacity grid allocations"}</span>
+                <span className="text-[11px] text-text-muted">
+                    {isWeekLoading ? "Loading..." : isCreatingConsultant ? "Adding consultant..." : isPending ? "Saving..." : "Synced with capacity grid allocations"}
+                </span>
             </div>
 
             <div className="border border-border/50 bg-surface/20 rounded-xl overflow-hidden shrink-0">
@@ -315,26 +449,46 @@ export function ConsultantUtilization({
                         <Users className="w-4 h-4 text-cyan-400" />
                         <h3 className="text-sm font-semibold text-text-main">CONSULTANT UTILIZATION</h3>
                     </div>
-                    <div className="flex items-center gap-2 rounded-md border border-border/70 bg-surface/20 p-1">
-                        <button
-                            type="button"
-                            onClick={() => setActiveRosterTab("active")}
-                            className={cn(
-                                "rounded px-2.5 py-1 text-xs font-medium transition-colors",
-                                activeRosterTab === "active" ? "bg-surface-hover text-white" : "text-text-muted hover:text-white"
-                            )}
+                    <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-2 rounded-md border border-border/70 bg-surface/20 p-1">
+                            <button
+                                type="button"
+                                onClick={() => setActiveRosterTab("active")}
+                                className={cn(
+                                    "rounded px-2.5 py-1 text-xs font-medium transition-colors",
+                                    activeRosterTab === "active" ? "bg-surface-hover text-white" : "text-text-muted hover:text-white"
+                                )}
+                            >
+                                Active ({activeConsultants.length})
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => setActiveRosterTab("removed")}
+                                className={cn(
+                                    "rounded px-2.5 py-1 text-xs font-medium transition-colors",
+                                    activeRosterTab === "removed" ? "bg-surface-hover text-white" : "text-text-muted hover:text-white"
+                                )}
+                            >
+                                Removed ({removedConsultants.length})
+                            </button>
+                        </div>
+                            <button
+                                type="button"
+                                disabled={isPastWeek || isPending || isWeekLoading}
+                                onClick={handleCopyPriorWeek}
+                            className="inline-flex items-center gap-2 rounded-md border border-border/60 bg-surface/20 px-3 py-2 text-xs font-semibold text-text-main transition-colors hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50"
                         >
-                            Active ({activeConsultants.length})
+                            <Copy className="h-3.5 w-3.5" />
+                            Copy Prior Week
                         </button>
                         <button
                             type="button"
-                            onClick={() => setActiveRosterTab("removed")}
-                            className={cn(
-                                "rounded px-2.5 py-1 text-xs font-medium transition-colors",
-                                activeRosterTab === "removed" ? "bg-surface-hover text-white" : "text-text-muted hover:text-white"
-                            )}
+                            disabled={isPastWeek || isCreatingConsultant}
+                            onClick={() => setIsAddConsultantOpen(true)}
+                            className="inline-flex items-center gap-2 rounded-md border border-indigo-500/40 bg-indigo-500/10 px-3 py-2 text-xs font-semibold text-indigo-100 transition-colors hover:bg-indigo-500/20 disabled:cursor-not-allowed disabled:opacity-50"
                         >
-                            Removed ({removedConsultants.length})
+                            <Plus className="h-3.5 w-3.5" />
+                            Add Consultant
                         </button>
                     </div>
                 </div>
@@ -365,7 +519,12 @@ export function ConsultantUtilization({
 
                                 return (
                                     <tr key={consultant.id} className="hover:bg-surface/30 transition-colors">
-                                        <td className="px-5 py-2 font-medium text-text-main">{consultant.name}</td>
+                                        <td className="px-5 py-2">
+                                            <div className="font-medium text-text-main">{consultant.name}</div>
+                                            {consultant.email ? (
+                                                <div className="mt-0.5 text-[11px] text-text-muted">{consultant.email}</div>
+                                            ) : null}
+                                        </td>
                                         <td className="px-5 py-2 border-l border-border/30">
                                             <input
                                                 type="number"
@@ -500,6 +659,83 @@ export function ConsultantUtilization({
                         >
                             {rosterConfirm.action === "hide" ? <Trash2 className="w-4 h-4" /> : <RotateCcw className="w-4 h-4" />}
                             {rosterConfirm.action === "hide" ? "Hide Consultant" : "Reinstate Consultant"}
+                        </button>
+                    </div>
+                </div>
+            </div>
+        )}
+        {isAddConsultantOpen && (
+            <div className="fixed inset-0 z-[86] flex items-center justify-center bg-black/55 backdrop-blur-sm p-4">
+                <div className="w-full max-w-md overflow-hidden rounded-2xl border border-border/60 bg-[#111318] shadow-[0_24px_80px_rgba(0,0,0,0.45)]">
+                    <div className="flex items-center justify-between border-b border-border/50 bg-surface/80 px-5 py-4">
+                        <div>
+                            <div className="text-sm font-semibold text-text-main">Add Consultant</div>
+                            <div className="mt-1 text-xs text-text-muted">
+                                Save a consultant to the roster with first name, second name, and email address.
+                            </div>
+                        </div>
+                        <button
+                            type="button"
+                            onClick={closeAddConsultantModal}
+                            className="inline-flex items-center justify-center rounded-md border border-border/60 p-2 text-text-muted hover:bg-surface-hover hover:text-white"
+                            aria-label="Close add consultant modal"
+                        >
+                            <X className="w-4 h-4" />
+                        </button>
+                    </div>
+                    <div className="space-y-4 px-5 py-4">
+                        <label className="block space-y-1.5">
+                            <span className="text-xs font-medium uppercase tracking-wider text-text-muted">First Name</span>
+                            <input
+                                type="text"
+                                value={addConsultantForm.firstName}
+                                onChange={(e) => setAddConsultantForm((prev) => ({ ...prev, firstName: e.target.value }))}
+                                placeholder="Jane"
+                                className="w-full rounded-lg border border-border/70 bg-surface px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                            />
+                        </label>
+                        <label className="block space-y-1.5">
+                            <span className="text-xs font-medium uppercase tracking-wider text-text-muted">Second Name</span>
+                            <input
+                                type="text"
+                                value={addConsultantForm.lastName}
+                                onChange={(e) => setAddConsultantForm((prev) => ({ ...prev, lastName: e.target.value }))}
+                                placeholder="Doe"
+                                className="w-full rounded-lg border border-border/70 bg-surface px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                            />
+                        </label>
+                        <label className="block space-y-1.5">
+                            <span className="text-xs font-medium uppercase tracking-wider text-text-muted">Email Address</span>
+                            <input
+                                type="email"
+                                value={addConsultantForm.email}
+                                onChange={(e) => setAddConsultantForm((prev) => ({ ...prev, email: e.target.value }))}
+                                placeholder="jane.doe@company.com"
+                                className="w-full rounded-lg border border-border/70 bg-surface px-3 py-2 text-sm text-white outline-none transition-colors focus:border-indigo-500"
+                            />
+                        </label>
+                        {addConsultantError ? (
+                            <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-200">
+                                {addConsultantError}
+                            </div>
+                        ) : null}
+                    </div>
+                    <div className="flex items-center justify-end gap-2 border-t border-border/50 bg-surface/50 px-5 py-4">
+                        <button
+                            type="button"
+                            onClick={closeAddConsultantModal}
+                            className="inline-flex items-center gap-2 rounded-md border border-border/60 px-3 py-2 text-sm text-text-main hover:bg-surface-hover"
+                        >
+                            Cancel
+                        </button>
+                        <button
+                            type="button"
+                            disabled={isCreatingConsultant}
+                            onClick={handleAddConsultant}
+                            className="inline-flex items-center gap-2 rounded-md border border-indigo-500/40 bg-indigo-500/10 px-3 py-2 text-sm text-indigo-100 hover:bg-indigo-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                            <Plus className="w-4 h-4" />
+                            {isCreatingConsultant ? "Adding..." : "Save Consultant"}
                         </button>
                     </div>
                 </div>

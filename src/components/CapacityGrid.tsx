@@ -8,10 +8,12 @@ import {
     CapacityGridPayload,
     CapacityGridResource,
     CapacityGridRow,
+    ClientDirectoryRecord,
     EditableTaskBillableRollupRecord,
+    copyCapacityGridFromPriorWeek,
     updateCapacityGridConfig
 } from "@/app/actions";
-import { ArrowUpRight, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Grid2x2, Plus, Save, Trash2, X } from "lucide-react";
+import { ArrowUpRight, ChevronLeft, ChevronRight, Copy, Grid2x2, Save, Trash2, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ClickUpTask } from "@/lib/clickup";
 import type { FolderWithLists } from "@/components/Sidebar";
@@ -22,10 +24,14 @@ interface CapacityGridProps {
     onGridChange?: (nextGrid: CapacityGridPayload) => void;
     consultants?: Array<{ id: number; name: string }>;
     consultantConfigsById?: Record<number, { maxCapacity: number; billableCapacity: number; notes: string }>;
+    clientDirectory?: ClientDirectoryRecord[];
     tasks?: ClickUpTask[];
     folders?: FolderWithLists[];
     activeAssigneeFilter?: string | null;
     billableRollups?: EditableTaskBillableRollupRecord[];
+    onNavigateWeek?: (nextWeek: string) => void;
+    onSelectTab?: (tab: string) => void;
+    isWeekLoading?: boolean;
 }
 
 function toNumber(value: string): number {
@@ -37,13 +43,15 @@ function normalizeName(value: string) {
     return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
 }
 
+function formatConsultantHeaderName(value: string) {
+    const tokens = String(value || "").trim().split(/\s+/).filter(Boolean);
+    if (tokens.length <= 1) return tokens[0] ?? "";
+    return [tokens[0], ...tokens.slice(1).map((token) => `${token[0]?.toUpperCase() || ""}.`)].join(" ");
+}
+
 function clientIdFromName(value: string) {
     const normalized = normalizeName(value);
     return normalized.length > 0 ? normalized : `client-${Date.now()}`;
-}
-
-function roundToHalfStep(value: number) {
-    return Math.round(value * 2) / 2;
 }
 
 function clampNonNegative(value: number) {
@@ -98,10 +106,14 @@ export function CapacityGrid({
     onGridChange,
     consultants = [],
     consultantConfigsById = {},
+    clientDirectory = [],
     tasks = [],
     folders = [],
     activeAssigneeFilter = null,
     billableRollups = [],
+    onNavigateWeek,
+    onSelectTab,
+    isWeekLoading = false,
 }: CapacityGridProps) {
     const router = useRouter();
     const pathname = usePathname();
@@ -114,6 +126,7 @@ export function CapacityGrid({
     const [consultantConfigs, setConsultantConfigs] = useState<Record<number, { maxCapacity: number; billableCapacity: number; notes: string }>>(consultantConfigsById);
     const [noteEditor, setNoteEditor] = useState<AllocationNoteEditorState | null>(null);
     const [removeClientConfirm, setRemoveClientConfirm] = useState<RemoveClientConfirmState | null>(null);
+    const [gridMode, setGridMode] = useState<"plan" | "view">("plan");
     const initializedWeekRef = useRef<string>("");
     const autoFillRunKeyRef = useRef<string>("");
     const navUnlockTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -137,8 +150,37 @@ export function CapacityGrid({
         [resources]
     );
 
+    const clientDirectoryLookup = useMemo(() => {
+        const byId = new Map<string, ClientDirectoryRecord>();
+        const byName = new Map<string, ClientDirectoryRecord>();
+        clientDirectory.forEach((client) => {
+            if (!client || client.isActive === false) return;
+            const idKey = normalizeName(String(client.id ?? ""));
+            const nameKey = normalizeName(String(client.name ?? ""));
+            if (idKey) byId.set(idKey, client);
+            if (nameKey) byName.set(nameKey, client);
+        });
+        return { byId, byName };
+    }, [clientDirectory]);
+
+    const getClientMetadata = useCallback((row: CapacityGridRow) => {
+        const idKey = normalizeName(String(row.id ?? ""));
+        const nameKey = normalizeName(String(row.client ?? ""));
+        return clientDirectoryLookup.byId.get(idKey) ?? clientDirectoryLookup.byName.get(nameKey) ?? null;
+    }, [clientDirectoryLookup]);
+
     const activeWeekDate = useMemo(() => new Date(activeWeekStr + "T00:00:00"), [activeWeekStr]);
-    const weekParamFor = (nextDate: Date) => `/?week=${format(nextDate, "yyyy-MM-dd")}&tab=capacity-grid`;
+    const isNavigationBlocked = !onNavigateWeek && (isWeekNavLocked || isWeekLoading);
+    const weekParamFor = useCallback((nextDate: Date) => {
+        const params = new URLSearchParams(searchParams?.toString() ?? "");
+        params.set("week", format(nextDate, "yyyy-MM-dd"));
+        params.set("tab", "capacity-grid");
+        params.delete("gridScrollLeft");
+        params.delete("gridScrollTop");
+        params.delete("gridRowId");
+        params.delete("gridResourceId");
+        return `${pathname}?${params.toString()}`;
+    }, [pathname, searchParams]);
     const buildCapacityReturnTo = useCallback((rowId?: string | null, resourceId?: string | null) => {
         const params = new URLSearchParams(searchParams?.toString() ?? "");
         params.set("tab", "capacity-grid");
@@ -263,19 +305,23 @@ export function CapacityGrid({
     }, []);
 
     const navigateToWeek = useCallback((nextDate: Date | null) => {
-        if (isWeekNavLocked) return;
+        if (isNavigationBlocked) return;
         const currentWeekStr = format(startOfWeek(new Date(), { weekStartsOn: 1 }), "yyyy-MM-dd");
         if (nextDate === null && activeWeekStr === currentWeekStr) return;
         if (nextDate && format(nextDate, "yyyy-MM-dd") === activeWeekStr) return;
 
-        const href = nextDate ? weekParamFor(nextDate) : "/?tab=capacity-grid";
-        setIsWeekNavLocked(true);
-        window.location.href = href;
-        navUnlockTimerRef.current = setTimeout(() => {
-            setIsWeekNavLocked(false);
-            navUnlockTimerRef.current = null;
-        }, 500);
-    }, [activeWeekStr, isWeekNavLocked]);
+        const href = nextDate ? weekParamFor(nextDate) : `${pathname}?tab=capacity-grid`;
+        if (onNavigateWeek) {
+            onNavigateWeek(nextDate ? format(nextDate, "yyyy-MM-dd") : currentWeekStr);
+        } else {
+            setIsWeekNavLocked(true);
+            router.push(href, { scroll: false });
+            navUnlockTimerRef.current = setTimeout(() => {
+                setIsWeekNavLocked(false);
+                navUnlockTimerRef.current = null;
+            }, 500);
+        }
+    }, [activeWeekStr, isNavigationBlocked, onNavigateWeek, pathname, router, weekParamFor]);
 
     const handlePrevWeek = () => {
         navigateToWeek(subWeeks(activeWeekDate, 1));
@@ -290,10 +336,12 @@ export function CapacityGrid({
     useEffect(() => {
         const previousWeekHref = weekParamFor(subWeeks(activeWeekDate, 1));
         const nextWeekHref = weekParamFor(addWeeks(activeWeekDate, 1));
-        router.prefetch(previousWeekHref);
-        router.prefetch(nextWeekHref);
-        router.prefetch("/?tab=capacity-grid");
-    }, [router, activeWeekDate, activeWeekStr]);
+        if (!onNavigateWeek) {
+            router.prefetch(previousWeekHref);
+            router.prefetch(nextWeekHref);
+            router.prefetch("/?tab=capacity-grid");
+        }
+    }, [router, activeWeekDate, activeWeekStr, onNavigateWeek, weekParamFor]);
 
     const persist = useCallback((nextRows: CapacityGridRow[], nextResources: CapacityGridResource[] = resources) => {
         const sanitizedRows = sanitizeCapacityRows(nextRows);
@@ -309,6 +357,15 @@ export function CapacityGrid({
             });
         });
     }, [activeWeekStr, onGridChange, resources, startTransition]);
+
+    const handleCopyPriorWeek = () => {
+        startTransition(async () => {
+            const copied = await copyCapacityGridFromPriorWeek(activeWeekStr, consultants);
+            setResources(copied.resources ?? []);
+            setRows(sanitizeCapacityRows(copied.rows ?? []));
+            onGridChange?.(copied);
+        });
+    };
 
     const updateRow = (rowId: string, patch: Partial<CapacityGridRow>) => {
         setRows((prev) => {
@@ -455,15 +512,18 @@ export function CapacityGrid({
 
     const rowStats = useMemo(() => {
         return rows.map((row) => {
+            const clientMeta = getClientMetadata(row);
+            const rowMin = Number(clientMeta?.min ?? row.wkMin ?? 0);
+            const rowMax = Number(clientMeta?.max ?? row.wkMax ?? 0);
             const total = visibleResources.reduce((sum, resource) => sum + Number(row.allocations[resource.id]?.hours ?? 0), 0);
             return {
                 id: row.id,
                 total,
-                gapToMin: total - Number(row.wkMin || 0),
-                gapToMax: Number(row.wkMax || 0) - total,
+                gapToMin: total - rowMin,
+                gapToMax: rowMax - total,
             };
         });
-    }, [rows, visibleResources]);
+    }, [getClientMetadata, rows, visibleResources]);
 
     const totals = useMemo(() => {
         const hoursByResource: Record<string, number> = {};
@@ -471,8 +531,8 @@ export function CapacityGrid({
             hoursByResource[resource.id] = rows.reduce((sum, row) => sum + Number(row.allocations[resource.id]?.hours ?? 0), 0);
         });
 
-        const wkMinTotal = rows.reduce((sum, row) => sum + Number(row.wkMin || 0), 0);
-        const wkMaxTotal = rows.reduce((sum, row) => sum + Number(row.wkMax || 0), 0);
+        const wkMinTotal = rows.reduce((sum, row) => sum + Number(getClientMetadata(row)?.min ?? row.wkMin ?? 0), 0);
+        const wkMaxTotal = rows.reduce((sum, row) => sum + Number(getClientMetadata(row)?.max ?? row.wkMax ?? 0), 0);
         const totalHours = Object.values(hoursByResource).reduce((a, b) => a + b, 0);
 
         return {
@@ -483,7 +543,7 @@ export function CapacityGrid({
             gapToMin: totalHours - wkMinTotal,
             gapToMax: wkMaxTotal - totalHours,
         };
-    }, [rows, visibleResources]);
+    }, [getClientMetadata, rows, visibleResources]);
 
     const billableCapacityByResource = useMemo(() => {
         const billableByName = new Map<string, number>();
@@ -512,6 +572,11 @@ export function CapacityGrid({
         return map;
     }, [visibleResources, consultants, consultantConfigs]);
 
+    const totalCapacity = useMemo(
+        () => Object.values(billableCapacityByResource).reduce((sum, hours) => sum + Number(hours || 0), 0),
+        [billableCapacityByResource]
+    );
+
     const getConsultantHeaderClass = (resourceId: string) => {
         const cap = Number(billableCapacityByResource[resourceId] ?? 0);
         const allocated = Number(totals.hoursByResource[resourceId] ?? 0);
@@ -526,6 +591,11 @@ export function CapacityGrid({
         if (wkMax <= 0) return "text-emerald-400";
         if (total > wkMax) return "text-red-400";
         return "text-emerald-400";
+    };
+
+    const getClientMetaLineClass = (total: number, wkMax: number) => {
+        if (wkMax > 0 && total > wkMax) return "text-red-300";
+        return "text-text-muted";
     };
 
     const getScopeLabels = useCallback((scopeType: string, scopeId: string) => {
@@ -805,7 +875,7 @@ export function CapacityGrid({
                     <div className="flex items-center overflow-hidden rounded-xl border border-border/60 bg-[#0f1320]/80 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
                         <button
                             onClick={handlePrevWeek}
-                            disabled={isWeekNavLocked}
+                            disabled={isNavigationBlocked}
                             className="flex h-10 w-10 items-center justify-center border-r border-border/60 text-text-muted transition-colors hover:bg-surface-hover hover:text-white"
                             aria-label="Previous week"
                         >
@@ -817,7 +887,7 @@ export function CapacityGrid({
                         </div>
                         <button
                             onClick={handleNextWeek}
-                            disabled={isWeekNavLocked}
+                            disabled={isNavigationBlocked}
                             className="flex h-10 w-10 items-center justify-center border-l border-border/60 text-text-muted transition-colors hover:bg-surface-hover hover:text-white"
                             aria-label="Next week"
                         >
@@ -826,7 +896,7 @@ export function CapacityGrid({
                     </div>
                     <button
                         onClick={handleCurrentWeek}
-                        disabled={isWeekNavLocked}
+                        disabled={isNavigationBlocked}
                         className={cn(
                             "h-10 rounded-xl border px-4 text-xs font-semibold transition-colors",
                             isCurrentWeek
@@ -839,19 +909,54 @@ export function CapacityGrid({
                     <span className="rounded-full border border-border/50 bg-surface/20 px-3 py-1 text-xs text-text-muted">{weekLabel}</span>
                 </div>
                 <div className="flex items-center gap-3">
+                    <div className="flex items-center rounded-xl border border-border/60 bg-[#0f1320]/80 p-1">
+                        <button
+                            type="button"
+                            onClick={() => setGridMode("plan")}
+                            className={cn(
+                                "rounded-lg px-3 py-2 text-xs font-semibold transition-colors",
+                                gridMode === "plan" ? "bg-white/[0.08] text-white" : "text-text-muted hover:text-white"
+                            )}
+                        >
+                            Plan View
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => setGridMode("view")}
+                            className={cn(
+                                "rounded-lg px-3 py-2 text-xs font-semibold transition-colors",
+                                gridMode === "view" ? "bg-white/[0.08] text-white" : "text-text-muted hover:text-white"
+                            )}
+                        >
+                            View Mode
+                        </button>
+                    </div>
                     <button
                         type="button"
-                        onClick={handleAddClient}
+                        onClick={handleCopyPriorWeek}
                         className="inline-flex items-center gap-2 rounded-xl border border-border/60 bg-[#0f1320]/80 px-4 py-2 text-xs font-semibold text-text-main hover:bg-surface-hover"
                     >
-                        <Plus className="w-3.5 h-3.5" />
-                        Add Client
+                        <Copy className="w-3.5 h-3.5" />
+                        Copy Prior Week
                     </button>
-                    <span className="rounded-full border border-border/50 bg-surface/20 px-3 py-1 text-[11px] text-text-muted">{isPending ? "Saving..." : "Persistent planning scratchboard"}</span>
+                    <button
+                        type="button"
+                        onClick={() => onSelectTab?.("client-setup")}
+                        className="inline-flex items-center gap-2 rounded-xl border border-border/60 bg-[#0f1320]/80 px-4 py-2 text-xs font-semibold text-text-main hover:bg-surface-hover"
+                    >
+                        Client Setup
+                    </button>
+                    <span className="rounded-full border border-border/50 bg-surface/20 px-3 py-1 text-[11px] text-text-muted">
+                        {isWeekLoading ? "Loading..." : isPending ? "Saving..." : "Persistent planning scratchboard"}
+                    </span>
                 </div>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-5 gap-3">
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-6">
+                <div className={monochromeMetricCardClass}>
+                    <div className="text-[10px] uppercase tracking-[0.18em] text-text-muted">Consultant Total Capacity</div>
+                    <div className="mt-2 text-3xl font-bold text-white">{totalCapacity.toFixed(1)}</div>
+                </div>
                 <div className={monochromeMetricCardClass}>
                     <div className="text-[10px] uppercase tracking-[0.18em] text-text-muted">Planned</div>
                     <div className="mt-2 text-3xl font-bold text-white">{totals.totalHours.toFixed(1)}</div>
@@ -877,14 +982,9 @@ export function CapacityGrid({
             </div>
 
             <div ref={gridScrollRef} className="relative max-h-[calc(100vh-18rem)] overflow-auto rounded-[28px] border border-border/50 bg-[linear-gradient(180deg,rgba(18,23,36,0.94)_0%,rgba(12,16,24,0.98)_100%)] shadow-[0_24px_70px_rgba(0,0,0,0.28)]">
-                <table className="min-w-[1800px] w-full border-separate border-spacing-0 text-[12px]">
+                <table className="min-w-[1680px] w-full border-separate border-spacing-0 text-[12px]">
                     <thead>
                         <tr className="border-b-2 border-border/50 text-text-muted text-[11px] font-bold tracking-wider bg-[#111626]/90 text-[#94a3b8] cap-none">
-                            <th className={cn("px-3 py-3 text-right border-r border-border/40", headerTopRowStickyClass)}>Team</th>
-                            <th className={cn("px-3 py-3 text-left border-r border-border/40", headerTopRowStickyClass)}>SA</th>
-                            <th className={cn("px-3 py-3 text-left border-r border-border/40", headerTopRowStickyClass)}>Deal Type</th>
-                            <th className={cn("px-3 py-3 text-right border-r border-border/40", headerTopRowStickyClass)}>Wk Min</th>
-                            <th className={cn("px-3 py-3 text-right border-r border-border/40", headerTopRowStickyClass)}>Wk Max</th>
                             <th className={cn("px-2 py-2 text-left border-r border-border/40", headerTopRowStickyClass, clientHeaderStickyClass)}>
                                 <div className="rounded-xl border border-border/55 bg-[#1a2035] px-4 py-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.02)]">
                                     <div className="text-[10px] font-medium uppercase tracking-[0.18em] text-text-muted">Client</div>
@@ -893,27 +993,34 @@ export function CapacityGrid({
                             {visibleResources.map((resource) => {
                                 const used = Number(totals.hoursByResource[resource.id] ?? 0);
                                 const maxBillable = Number(billableCapacityByResource[resource.id] ?? 0);
+                                const displayName = formatConsultantHeaderName(resource.name);
                                 return (
-                                    <th key={resource.id} className={cn("w-[132px] min-w-[132px] max-w-[132px] px-2 py-2 text-center border-r border-border/40", headerTopRowStickyClass)}>
-                                        <div className="flex h-[82px] w-full flex-col items-center justify-center gap-2 rounded-xl border border-border/55 bg-[#1a2035] px-3 py-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] leading-tight">
-                                            <span className="text-[10px] font-medium uppercase tracking-[0.18em] text-text-muted">
-                                                Consultant
+                                    <th key={resource.id} className={cn("w-[172px] min-w-[172px] max-w-[172px] px-2 py-2 text-center border-r border-border/40", headerTopRowStickyClass)}>
+                                        <div className="flex min-h-[102px] w-full flex-col items-center justify-center gap-1.5 rounded-xl border border-border/55 bg-[#1a2035] px-3 py-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] leading-tight">
+                                            <span className="text-[10px] font-medium uppercase tracking-[0.18em] text-text-muted">Consultant</span>
+                                            <span
+                                                title={resource.name}
+                                                className={cn("max-w-full truncate text-center text-[14px] font-semibold leading-4 transition-colors whitespace-nowrap", getConsultantHeaderClass(resource.id))}
+                                            >
+                                                {displayName}
                                             </span>
-                                            <span className={cn("font-semibold transition-colors", getConsultantHeaderClass(resource.id))}>
-                                                {resource.name}
+                                            <span className={cn("max-w-full text-center text-[10px] font-semibold leading-4 whitespace-nowrap", getConsultantHeaderClass(resource.id))}>
+                                                Planned {used.toFixed(1)}
                                             </span>
-                                            <span className={cn("text-[11px] font-semibold", getConsultantHeaderClass(resource.id))}>
-                                                {used.toFixed(1)} / {maxBillable.toFixed(1)}
+                                            <span className={cn("max-w-full text-center text-[10px] font-semibold leading-4 whitespace-nowrap", getConsultantHeaderClass(resource.id))}>
+                                                Total Capacity {maxBillable.toFixed(1)}
                                             </span>
                                         </div>
                                     </th>
                                 );
                             })}
-                            <th className={cn("px-3 py-3 text-right border-r border-border/40", headerTopRowStickyClass)}>Planned / Actual</th>
-                            <th className={cn("px-3 py-3 text-right border-r border-border/40", headerTopRowStickyClass)}>Gap to Min</th>
-                            <th className={cn("px-3 py-3 text-right border-r border-border/40", headerTopRowStickyClass)}>Gap to Max</th>
+                            <th className={cn("px-3 py-3 text-right border-r border-border/40", headerTopRowStickyClass)}>Planned</th>
+                            {gridMode === "view" && (
+                                <th className={cn("px-3 py-3 text-right border-r border-border/40", headerTopRowStickyClass)}>Actuals</th>
+                            )}
+                            <th className={cn("px-3 py-3 text-right border-r border-border/40", headerTopRowStickyClass)}>Min</th>
+                            <th className={cn("px-3 py-3 text-right border-r border-border/40", headerTopRowStickyClass)}>Max</th>
                             <th className={cn("px-3 py-3 text-left border-r border-border/40", headerTopRowStickyClass)}>Notes</th>
-                            <th className={cn("px-3 py-3 text-center", headerTopRowStickyClass)}>Actions</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -921,67 +1028,22 @@ export function CapacityGrid({
                             const stats = rowStats.find((s) => s.id === row.id);
                             const rowTotal = Number(stats?.total ?? 0);
                             const rowActualTotal = visibleResources.reduce((sum, resource) => sum + Number(getBillableActualsForCell(row, resource) ?? 0), 0);
-                            const clientStatusClass = getClientStatusClass(rowTotal, Number(row.wkMin || 0), Number(row.wkMax || 0));
+                            const clientMeta = getClientMetadata(row);
+                            const rowMin = Number(clientMeta?.min ?? row.wkMin ?? 0);
+                            const rowMax = Number(clientMeta?.max ?? row.wkMax ?? 0);
+                            const clientStatusClass = getClientStatusClass(rowTotal, rowMin, rowMax);
                             const laneClass = rowIndex % 2 === 0 ? "bg-[#0d121d]/72 hover:bg-[#12192a]/82" : "bg-[#101622]/78 hover:bg-[#151d30]/86";
                             const laneBorderClass = rowIndex % 2 === 0 ? "border-border/35" : "border-border/20";
                             const clientLaneClass = rowIndex % 2 === 0 ? "bg-[#121b35]" : "bg-[#0f1830]";
                             return (
                                 <tr key={row.id} className={cn("border-t transition-colors", laneClass, laneBorderClass)}>
-                                    <td className={cn("px-2 py-2 border-r text-right", laneBorderClass)}>
-                                        <input
-                                            type="number"
-                                            value={row.team}
-                                            min="0"
-                                            onChange={(e) => updateRow(row.id, { team: clampNonNegative(toNumber(e.target.value)) })}
-                                            onBlur={() => persist(rows)}
-                                            className="w-12 rounded-lg border border-transparent bg-white/[0.02] px-1 py-1 text-right text-text-main focus:border-border/70 focus:bg-white/[0.04]"
-                                        />
-                                    </td>
-                                    <td className={cn("px-2 py-2 border-r", laneBorderClass)}>
-                                        <input
-                                            value={row.teamSa}
-                                            onChange={(e) => updateRow(row.id, { teamSa: e.target.value })}
-                                            onBlur={() => persist(rows)}
-                                            className="w-28 rounded-lg border border-transparent bg-white/[0.02] px-2 py-1 text-text-main focus:border-border/70 focus:bg-white/[0.04]"
-                                        />
-                                    </td>
-                                    <td className={cn("px-2 py-2 border-r", laneBorderClass)}>
-                                        <input
-                                            value={row.dealType}
-                                            onChange={(e) => updateRow(row.id, { dealType: e.target.value })}
-                                            onBlur={() => persist(rows)}
-                                            className="w-20 rounded-lg border border-transparent bg-white/[0.02] px-2 py-1 text-text-main focus:border-border/70 focus:bg-white/[0.04]"
-                                        />
-                                    </td>
-                                    <td className={cn("px-2 py-2 text-right border-r", laneBorderClass)}>
-                                        <input
-                                            type="number"
-                                            step="0.5"
-                                            min="0"
-                                            value={row.wkMin}
-                                            onChange={(e) => updateRow(row.id, { wkMin: clampNonNegative(toNumber(e.target.value)) })}
-                                            onBlur={() => persist(rows)}
-                                            className="w-16 rounded-lg border border-transparent bg-white/[0.02] px-1 py-1 text-right text-text-main focus:border-border/70 focus:bg-white/[0.04]"
-                                        />
-                                    </td>
-                                    <td className={cn("px-2 py-2 text-right border-r", laneBorderClass)}>
-                                        <input
-                                            type="number"
-                                            step="0.5"
-                                            min="0"
-                                            value={row.wkMax}
-                                            onChange={(e) => updateRow(row.id, { wkMax: clampNonNegative(toNumber(e.target.value)) })}
-                                            onBlur={() => persist(rows)}
-                                            className="w-16 rounded-lg border border-transparent bg-white/[0.02] px-1 py-1 text-right text-text-main focus:border-border/70 focus:bg-white/[0.04]"
-                                        />
-                                    </td>
                                     <td className={cn("px-2 py-2 border-r", laneBorderClass, clientBodyStickyClass, clientLaneClass)}>
-                                        <input
-                                            value={row.client}
-                                            onChange={(e) => updateRow(row.id, { client: e.target.value })}
-                                            onBlur={() => persist(rows)}
-                                            className={cn("w-44 rounded-xl border border-white/[0.04] bg-white/[0.03] px-3 py-2 font-medium shadow-[inset_0_1px_0_rgba(255,255,255,0.03)] focus:border-border/70 focus:bg-white/[0.05]", clientStatusClass)}
-                                        />
+                                        <div className={cn("w-56 rounded-xl border border-white/[0.04] bg-white/[0.03] px-3 py-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]", clientStatusClass)}>
+                                            <div className={cn("font-medium", rowMax > 0 && rowTotal > rowMax ? "text-red-400" : clientStatusClass)}>{clientMeta?.name ?? row.client}</div>
+                                            <div className={cn("mt-1 text-[10px] uppercase tracking-[0.18em]", getClientMetaLineClass(rowTotal, rowMax))}>
+                                                Team {(clientMeta?.team ?? row.team) || "-"} · {clientMeta?.sa || row.teamSa || "No SA"} · {clientMeta?.dealType || row.dealType || "No Deal Type"}
+                                            </div>
+                                        </div>
                                     </td>
                                     {visibleResources.map((resource) => (
                                         <Fragment key={`${row.id}-${resource.id}`}>
@@ -1000,96 +1062,56 @@ export function CapacityGrid({
                                                     ? "ring-2 ring-slate-300/45 border-slate-300/60 shadow-[0_0_0_1px_rgba(203,213,225,0.16)]"
                                                     : "";
                                                 const noteHint = allocationNote ? ` | Note: ${allocationNote}` : "";
-                                                const handleStepAllocation = (delta: number) => {
-                                                    const nextValue = Math.max(0, roundToHalfStep(plannedHours + delta));
-                                                    updateAllocation(row.id, resource.id, nextValue);
-                                                    persist(
-                                                        rows.map((candidateRow) => {
-                                                            if (candidateRow.id !== row.id) return candidateRow;
-                                                            return {
-                                                                ...candidateRow,
-                                                                allocations: {
-                                                                    ...candidateRow.allocations,
-                                                                    [resource.id]: {
-                                                                        ...candidateRow.allocations[resource.id],
-                                                                        hours: nextValue,
-                                                                        source: "manual",
-                                                                    },
-                                                                },
-                                                            };
-                                                        })
-                                                    );
-                                                };
                                                 return (
                                                     <td
                                                         data-grid-cell={`${row.id}:${resource.id}`}
                                                         className={cn("px-1.5 py-2 text-center border-r", laneBorderClass)}
                                                     >
-                                                        <div className="mx-auto flex w-[88px] flex-col items-center gap-1">
-                                                            <div className="w-full">
-                                                                <div className="mb-0.5 flex items-center justify-center gap-1 text-[9px] uppercase tracking-wide text-text-muted">
-                                                                    <span>Planned</span>
-                                                                    <button
-                                                                        type="button"
-                                                                        onClick={(event) => {
-                                                                            event.preventDefault();
-                                                                            event.stopPropagation();
-                                                                            if (!clientBoardHref) return;
-                                                                            window.location.href = clientBoardHref;
-                                                                        }}
-                                                                        disabled={!clientBoardHref}
-                                                                        title={clientBoardHref ? `Open ${row.client} task board` : `No board match found for ${row.client}`}
-                                                                        className="inline-flex items-center justify-center rounded border border-border/50 p-[2px] text-text-muted hover:text-white hover:border-border/80 disabled:cursor-not-allowed disabled:opacity-35"
-                                                                        aria-label={`Open ${row.client} task board`}
-                                                                    >
-                                                                        <ArrowUpRight className="h-2.5 w-2.5" />
-                                                                    </button>
-                                                                </div>
-                                                                <div className="flex w-full items-stretch gap-1">
-                                                                    <input
-                                                                        type="number"
-                                                                        step="0.5"
-                                                                        min="0"
-                                                                        value={Number(row.allocations[resource.id]?.hours ?? 0).toFixed(1)}
-                                                                        onChange={(e) => updateAllocation(row.id, resource.id, clampNonNegative(toNumber(e.target.value)))}
-                                                                        onBlur={() => persist(rows)}
-                                                                        onDoubleClick={() => handleEditAllocationNote(row.id, resource.id, row.client, resource.name)}
-                                                                        title={`ClickUp Planned: ${clickupHours.toFixed(1)}h | Logged Actuals: ${actualHours.toFixed(1)}h${noteHint}`}
-                                                                        className={cn(
-                                                                            "block h-8 min-w-0 flex-1 rounded border px-2 py-1 text-right text-[12px] font-medium tabular-nums [appearance:textfield] [-moz-appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none focus:border-border cursor-text",
-                                                                            heatMapClass,
-                                                                            noteHighlightClass
-                                                                        )}
-                                                                    />
-                                                                    <div className="flex h-8 w-5 flex-col overflow-hidden rounded border border-border/45 bg-[#151a2b]">
-                                                                        <button
-                                                                            type="button"
-                                                                            onClick={() => handleStepAllocation(0.5)}
-                                                                            className="flex flex-1 items-center justify-center border-b border-border/45 text-text-muted transition hover:bg-white/[0.06] hover:text-white"
-                                                                            aria-label={`Increase planned hours for ${row.client} and ${resource.name}`}
-                                                                        >
-                                                                            <ChevronUp className="h-2.5 w-2.5" />
-                                                                        </button>
-                                                                        <button
-                                                                            type="button"
-                                                                            onClick={() => handleStepAllocation(-0.5)}
-                                                                            className="flex flex-1 items-center justify-center text-text-muted transition hover:bg-white/[0.06] hover:text-white"
-                                                                            aria-label={`Decrease planned hours for ${row.client} and ${resource.name}`}
-                                                                        >
-                                                                            <ChevronDown className="h-2.5 w-2.5" />
-                                                                        </button>
-                                                                    </div>
-                                                                </div>
-                                                            </div>
-                                                            <div className="w-full">
-                                                                <div className="mb-0.5 text-center text-[9px] uppercase tracking-wide text-text-muted">Actuals</div>
-                                                                <div
-                                                                    onDoubleClick={() => handleEditAllocationNote(row.id, resource.id, row.client, resource.name)}
-                                                                    title={allocationNote || "Double-click to add note"}
-                                                                    className={cn("flex h-8 w-full items-center justify-end rounded border px-2 py-1 text-right text-[12px] font-medium tabular-nums cursor-pointer", heatMapClass, noteHighlightClass)}
+                                                        <div className={cn("mx-auto flex w-full max-w-[148px] flex-col gap-1 rounded-xl border border-border/40 bg-[#151a2b]/90 p-2", noteHighlightClass)}>
+                                                            <div className="flex items-center justify-between text-[9px] uppercase tracking-wide text-text-muted">
+                                                                <span>{gridMode === "plan" ? "Plan" : "Plan vs Actual"}</span>
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={(event) => {
+                                                                        event.preventDefault();
+                                                                        event.stopPropagation();
+                                                                        if (!clientBoardHref) return;
+                                                                        window.location.href = clientBoardHref;
+                                                                    }}
+                                                                    disabled={!clientBoardHref}
+                                                                    title={clientBoardHref ? `Open ${row.client} task board` : `No board match found for ${row.client}`}
+                                                                    className="inline-flex items-center justify-center rounded border border-border/50 p-[2px] text-text-muted hover:text-white hover:border-border/80 disabled:cursor-not-allowed disabled:opacity-35"
+                                                                    aria-label={`Open ${row.client} task board`}
                                                                 >
-                                                                    {actualHours.toFixed(1)}
-                                                                </div>
+                                                                    <ArrowUpRight className="h-2.5 w-2.5" />
+                                                                </button>
+                                                            </div>
+                                                            <div className={cn("grid gap-1", gridMode === "view" ? "grid-cols-2" : "grid-cols-1")}>
+                                                                <input
+                                                                    type="text"
+                                                                    inputMode="decimal"
+                                                                    value={String(row.allocations[resource.id]?.hours ?? "")}
+                                                                    onChange={(e) => {
+                                                                        const next = e.target.value.replace(/[^0-9.]/g, "");
+                                                                        updateAllocation(row.id, resource.id, clampNonNegative(toNumber(next)));
+                                                                    }}
+                                                                    onBlur={() => persist(rows)}
+                                                                    onDoubleClick={() => handleEditAllocationNote(row.id, resource.id, row.client, resource.name)}
+                                                                    title={`ClickUp Planned: ${clickupHours.toFixed(1)}h | Logged Actuals: ${actualHours.toFixed(1)}h${noteHint}`}
+                                                                    className={cn(
+                                                                        "block h-9 min-w-0 rounded border px-2 py-1 text-right text-[12px] font-medium tabular-nums focus:border-border cursor-text",
+                                                                        heatMapClass
+                                                                    )}
+                                                                />
+                                                                {gridMode === "view" && (
+                                                                    <div
+                                                                        onDoubleClick={() => handleEditAllocationNote(row.id, resource.id, row.client, resource.name)}
+                                                                        title={allocationNote || "Double-click to add note"}
+                                                                        className={cn("flex h-9 items-center justify-end rounded border px-2 py-1 text-right text-[12px] font-medium tabular-nums cursor-pointer", heatMapClass)}
+                                                                    >
+                                                                        {actualHours.toFixed(1)}
+                                                                    </div>
+                                                                )}
                                                             </div>
                                                         </div>
                                                     </td>
@@ -1098,20 +1120,20 @@ export function CapacityGrid({
                                         </Fragment>
                                     ))}
                                     <td className={cn("px-3 py-2 text-right border-r font-bold text-white", laneBorderClass)}>
-                                        <div className="flex flex-col items-end gap-1">
-                                            <div className="inline-flex min-w-[5rem] justify-end rounded border border-border/35 bg-surface/30 px-2 py-1">
-                                                {Number(stats?.total ?? 0).toFixed(1)}
-                                            </div>
-                                            <div className="inline-flex min-w-[5rem] justify-end rounded border border-border/45 bg-white/[0.04] px-2 py-1 text-slate-100">
-                                                {Number(rowActualTotal ?? 0).toFixed(1)}
-                                            </div>
+                                        <div className="inline-flex min-w-[5rem] justify-end rounded border border-border/35 bg-surface/30 px-2 py-1">
+                                            {Number(stats?.total ?? 0).toFixed(1)}
                                         </div>
                                     </td>
-                                    <td className={cn("px-3 py-2 text-right border-r font-medium", laneBorderClass, (stats?.gapToMin ?? 0) >= 0 ? "text-white" : "text-slate-400")}>
-                                        {stats?.gapToMin.toFixed(1)}
+                                    {gridMode === "view" && (
+                                        <td className={cn("px-3 py-2 text-right border-r font-medium text-slate-100", laneBorderClass)}>
+                                            {Number(rowActualTotal ?? 0).toFixed(1)}
+                                        </td>
+                                    )}
+                                    <td className={cn("px-3 py-2 text-right border-r font-medium", laneBorderClass, rowTotal >= rowMin ? "text-white" : "text-slate-400")}>
+                                        {rowMin.toFixed(1)}
                                     </td>
-                                    <td className={cn("px-3 py-2 text-right border-r font-medium", laneBorderClass, (stats?.gapToMax ?? 0) >= 0 ? "text-text-main" : "text-slate-300")}>
-                                        {stats?.gapToMax.toFixed(1)}
+                                    <td className={cn("px-3 py-2 text-right border-r font-medium", laneBorderClass, rowMax >= rowTotal ? "text-text-main" : "text-slate-300")}>
+                                        {rowMax.toFixed(1)}
                                     </td>
                                     <td className={cn("px-2 py-2 border-r", laneBorderClass)}>
                                         <input
@@ -1121,25 +1143,34 @@ export function CapacityGrid({
                                             className="w-72 rounded-lg border border-transparent bg-white/[0.02] px-2 py-1 text-text-main focus:border-border/70 focus:bg-white/[0.04]"
                                         />
                                     </td>
-                                    <td className="px-3 py-2 text-center">
-                                        <button
-                                            type="button"
-                                            onClick={() => handleRemoveClient(row.id, row.client)}
-                                            className="inline-flex items-center justify-center rounded-md border border-border/60 p-1.5 text-text-muted hover:text-white hover:border-border/80 hover:bg-white/[0.05]"
-                                            aria-label={`Remove ${row.client}`}
-                                        >
-                                            <Trash2 className="w-3.5 h-3.5" />
-                                        </button>
-                                    </td>
                                 </tr>
                             );
                         })}
                     </tbody>
                     <tfoot>
                         <tr className="border-t border-border/40 bg-white/[0.03]">
-                            <td colSpan={3} className="px-3 py-2 font-semibold text-text-main border-r border-border/30">
+                            <td className="px-3 py-2 font-semibold text-text-main border-r border-border/30">
                                 Totals
                             </td>
+                            {visibleResources.map((resource) => (
+                                <td key={`tot-${resource.id}`} className="px-2 py-2 border-r border-border/20 text-right text-[11px] font-semibold text-text-main">
+                                    <div className="inline-flex min-w-[4.5rem] justify-end rounded border border-border/35 bg-surface/30 px-1.5 py-1">
+                                        {totals.hoursByResource[resource.id].toFixed(1)}
+                                    </div>
+                                </td>
+                            ))}
+                            <td className="px-3 py-2 text-right font-semibold border-r border-border/30">
+                                <div className="inline-flex min-w-[5rem] justify-end rounded border border-border/35 bg-surface/30 px-2 py-1">
+                                    {totals.totalHours.toFixed(1)}
+                                </div>
+                            </td>
+                            {gridMode === "view" && (
+                                <td className="px-3 py-2 text-right font-semibold border-r border-border/30 text-slate-100">
+                                    <div className="inline-flex min-w-[5rem] justify-end rounded border border-border/45 bg-white/[0.04] px-2 py-1 text-slate-100">
+                                        {totalActuals.toFixed(1)}
+                                    </div>
+                                </td>
+                            )}
                             <td className="px-3 py-2 text-right font-semibold border-r border-border/30 text-text-main">
                                 <div className="inline-flex min-w-[5rem] justify-end rounded border border-border/35 bg-surface/30 px-2 py-1">
                                     {totals.wkMinTotal.toFixed(1)}
@@ -1148,41 +1179,6 @@ export function CapacityGrid({
                             <td className="px-3 py-2 text-right font-semibold border-r border-border/30 text-text-main">
                                 <div className="inline-flex min-w-[5rem] justify-end rounded border border-border/35 bg-surface/30 px-2 py-1">
                                     {totals.wkMaxTotal.toFixed(1)}
-                                </div>
-                            </td>
-                            <td className={cn("px-3 py-2 border-r border-border/30 text-text-muted text-xs bg-white/[0.03]", clientFooterStickyClass)}>
-                                Clients
-                            </td>
-                            {visibleResources.map((resource) => (
-                                <td key={`tot-${resource.id}`} className="px-2 py-2 border-r border-border/20 text-right text-[11px] font-semibold text-text-main">
-                                    <div className="flex flex-col items-end gap-1">
-                                        <div className="inline-flex min-w-[4.5rem] justify-end rounded border border-border/35 bg-surface/30 px-1.5 py-1">
-                                            {totals.hoursByResource[resource.id].toFixed(1)}
-                                        </div>
-                                        <div className="inline-flex min-w-[4.5rem] justify-end rounded border border-border/45 bg-white/[0.04] px-1.5 py-1 text-slate-100">
-                                            {Number(actualsByResource[resource.id] ?? 0).toFixed(1)}
-                                        </div>
-                                    </div>
-                                </td>
-                            ))}
-                            <td className="px-3 py-2 text-right font-semibold border-r border-border/30">
-                                <div className="flex flex-col items-end gap-1">
-                                    <div className="inline-flex min-w-[5rem] justify-end rounded border border-border/35 bg-surface/30 px-2 py-1">
-                                        {totals.totalHours.toFixed(1)}
-                                    </div>
-                                    <div className="inline-flex min-w-[5rem] justify-end rounded border border-border/45 bg-white/[0.04] px-2 py-1 text-slate-100">
-                                        {totalActuals.toFixed(1)}
-                                    </div>
-                                </div>
-                            </td>
-                            <td className={cn("px-3 py-2 text-right font-semibold border-r border-border/30", totals.gapToMin >= 0 ? "text-white" : "text-slate-400")}>
-                                <div className="inline-flex min-w-[5rem] justify-end rounded border border-border/35 bg-surface/30 px-2 py-1">
-                                    {totals.gapToMin.toFixed(1)}
-                                </div>
-                            </td>
-                            <td className={cn("px-3 py-2 text-right font-semibold border-r border-border/30", totals.gapToMax >= 0 ? "text-text-main" : "text-slate-300")}>
-                                <div className="inline-flex min-w-[5rem] justify-end rounded border border-border/35 bg-surface/30 px-2 py-1">
-                                    {totals.gapToMax.toFixed(1)}
                                 </div>
                             </td>
                             <td className="px-3 py-2 text-xs text-text-muted border-r border-border/30">
@@ -1194,7 +1190,7 @@ export function CapacityGrid({
                             <td className="px-3 py-2"></td>
                         </tr>
                         <tr className="border-t border-border/30 bg-surface/20">
-                            <td colSpan={6} className="px-3 py-2 font-semibold text-text-main border-r border-border/30">
+                            <td className="px-3 py-2 font-semibold text-text-main border-r border-border/30">
                                 Billable Capacity
                             </td>
                             {visibleResources.map((resource) => (
@@ -1206,15 +1202,17 @@ export function CapacityGrid({
                             ))}
                             <td className="px-3 py-2 text-right font-semibold border-r border-border/30 text-slate-300">
                                 <div className="inline-flex min-w-[5rem] justify-end rounded border border-border/35 bg-surface/30 px-2 py-1">
-                                    {Object.values(billableCapacityByResource).reduce((sum, hrs) => sum + Number(hrs || 0), 0).toFixed(1)}
+                                    {totalCapacity.toFixed(1)}
                                 </div>
                             </td>
+                            {gridMode === "view" && (
+                                <td className="px-3 py-2 text-right font-semibold border-r border-border/30 text-slate-300">-</td>
+                            )}
                             <td className="px-3 py-2 text-right font-semibold border-r border-border/30 text-slate-300">-</td>
                             <td className="px-3 py-2 text-right font-semibold border-r border-border/30 text-slate-300">-</td>
                             <td className="px-3 py-2 text-xs text-text-muted border-r border-border/30">
                                 Pulled from Consultant Utilization billable capacity
                             </td>
-                            <td className="px-3 py-2"></td>
                         </tr>
                     </tfoot>
                 </table>

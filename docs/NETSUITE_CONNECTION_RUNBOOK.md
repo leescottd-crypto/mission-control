@@ -36,11 +36,14 @@ Optional:
 1. `NETSUITE_REALM` (defaults to account id)
 2. `NETSUITE_BASE_URL` (defaults to `https://<account>.suitetalk.api.netsuite.com`)
 3. `NETSUITE_HEALTH_PATH` (defaults to `/services/rest/record/v1/metadata-catalog?limit=1`)
+4. `NETSUITE_CONSULTANT_PATH` (defaults to `/services/rest/record/v1/employee?limit=1000`)
+5. `NETSUITE_SYNC_TOKEN` (recommended to protect sync `POST`s)
 
 ## 5) Mission Control Connector (Implemented)
 Implemented in this repo:
 1. OAuth 1.0a (HMAC-SHA256) signer in `src/lib/netsuite.ts`
 2. Health endpoint in `src/app/api/integrations/netsuite/health/route.ts`
+3. Consultant sync endpoint in `src/app/api/integrations/netsuite/consultants/sync/route.ts`
 
 ## 6) Smoke Test
 With app running:
@@ -52,6 +55,16 @@ With app running:
    - `400` missing env vars
    - `401/403` auth/role issue
    - `404` wrong domain/path
+
+Consultant sync:
+1. `GET /api/integrations/netsuite/consultants/sync`
+2. Confirm `missing` is empty and `consultantPath` is the expected employee endpoint.
+3. `POST /api/integrations/netsuite/consultants/sync` with `{ "dryRun": true }`
+4. Success criteria:
+   - HTTP `200`
+   - `ok: true`
+   - non-zero `fetched` if the source has consultant data
+5. When ready, run the same endpoint without `dryRun` to upsert consultants into Mission Control.
 
 ## 7) Troubleshooting
 1. `401 INVALID_LOGIN_ATTEMPT`:

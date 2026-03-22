@@ -43,6 +43,52 @@ model ClientConfig {
   @@unique([week, clientId])
 }
 
+model ClientDirectory {
+  id        String   @id
+  name      String
+  team      Int?
+  sa        String?
+  dealType  String?
+  min       Float?
+  max       Float?
+  isActive  Boolean  @default(true)
+  isInternal Boolean @default(false)
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Consultant {
+  id         Int      @id
+  firstName  String
+  lastName   String
+  email      String   @unique
+  source     String   @default("manual")
+  externalId String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([source, externalId])
+}
+
+model AppUser {
+  id               String   @id @default(cuid())
+  firstName        String
+  lastName         String
+  email            String   @unique
+  role             String   @default("member")
+  status           String   @default("invited")
+  googleSubject    String?
+  inviteToken      String?  @unique
+  inviteExpiresAt  DateTime?
+  invitedAt        DateTime?
+  inviteSentAt     DateTime?
+  inviteAcceptedAt DateTime?
+  lastLoginAt      DateTime?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+}
+
 model ConsultantConfig {
   id               String @id @default(cuid())
   week             String
@@ -73,15 +119,31 @@ model EditableTask {
   subject      String
   description  String   @default("")
   assignee     String   @default("")
+  isAi         Boolean  @default(false)
   billableHoursToday Float @default(0)
   status       String   @default("backlog")
   position     Float    @default(0)
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
   billableEntries TaskBillableEntry[]
+  attachments  TaskAttachment[]
 
   @@unique([week, scopeType, scopeId, sourceTaskId])
   @@index([week, scopeType, scopeId, status, position])
+}
+
+model TaskAttachment {
+  id           String   @id @default(cuid())
+  taskId       String
+  originalName String
+  storedName   String
+  mimeType     String   @default("application/octet-stream")
+  sizeBytes    Int      @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  task         EditableTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId, createdAt])
 }
 
 model TaskBillableEntry {
@@ -90,6 +152,7 @@ model TaskBillableEntry {
   entryDate String
   hours     Float    @default(0)
   note      String   @default("")
+  isValueAdd Boolean @default(false)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
   task      EditableTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
@@ -116,8 +179,41 @@ model TaskSidebarBoard {
   @@index([parentFolderId, orderIndex])
 }
 
+model TaskSidebarBoardPlacement {
+  id             String   @id @default(cuid())
+  boardId        String
+  source         String
+  boardName      String?
+  clientId       String?
+  clientName     String?
+  parentFolderId String
+  orderIndex     Int      @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([source, boardId])
+  @@index([parentFolderId, orderIndex])
+}
+
 model TaskSidebarHiddenBoard {
   id        String   @id @default(cuid())
   boardId   String   @unique
   createdAt DateTime @default(now())
+}
+
+model TaskSidebarHiddenFolder {
+  id        String   @id @default(cuid())
+  folderId  String   @unique
+  createdAt DateTime @default(now())
+}
+
+model TaskSidebarFolderOverride {
+  id        String   @id @default(cuid())
+  folderId   String
+  source    String
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([source, folderId])
 }

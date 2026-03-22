@@ -12,6 +12,8 @@ interface CommandCenterProps {
     timeEntries: TimeEntry[];
     activeWeekStr: string;
     dbConfig: any;
+    onNavigateWeek?: (nextWeek: string) => void;
+    isWeekLoading?: boolean;
 }
 
 interface ClientPaceTrackerRow {
@@ -27,6 +29,15 @@ interface ClientPaceTrackerRow {
     isPlannedOverMonthlyMax: boolean;
     isOverMonthlyMax: boolean;
     statusLabel: string;
+}
+
+interface CapacityHeaderMetrics {
+    totalCapacity: number;
+    planned: number;
+    actuals: number;
+    wkMinTotal: number;
+    wkMaxTotal: number;
+    gapToMin: number;
 }
 
 const DEFAULT_LEAD_TARGETS: Record<string, number> = {
@@ -49,28 +60,44 @@ function getAllocationHours(cell: unknown) {
     return Number(legacyCell?.hours ?? Number(legacyCell?.wt ?? 0) + Number(legacyCell?.wPlus ?? 0));
 }
 
-export function CommandCenter({ tasks, timeEntries, activeWeekStr, dbConfig }: CommandCenterProps) {
+export function CommandCenter({ tasks, timeEntries, activeWeekStr, dbConfig, onNavigateWeek, isWeekLoading = false }: CommandCenterProps) {
     const router = useRouter();
 
     // ----- Date & Week Logic -----
     // Append time to ensure we parse the exact UTC day without local timezone shift
-    const activeWeekDate = new Date(activeWeekStr + 'T00:00:00');
+    const activeWeekDate = useMemo(() => new Date(activeWeekStr + 'T00:00:00'), [activeWeekStr]);
 
     const currentWeekStart = startOfWeek(new Date(), { weekStartsOn: 1 });
     const currentWeekStartStr = format(currentWeekStart, 'yyyy-MM-dd');
 
     const isPastWeek = activeWeekStr < currentWeekStartStr;
     const isCurrentWeek = activeWeekStr === currentWeekStartStr;
+    const isNavigationBlocked = !onNavigateWeek && isWeekLoading;
 
     const weekParamFor = (nextDate: Date) => `/?week=${format(nextDate, "yyyy-MM-dd")}&tab=command-center`;
 
     const handlePrevWeek = () => {
+        const nextWeek = format(subWeeks(activeWeekDate, 1), "yyyy-MM-dd");
+        if (onNavigateWeek) {
+            onNavigateWeek(nextWeek);
+            return;
+        }
         router.push(weekParamFor(subWeeks(activeWeekDate, 1)));
     };
     const handleNextWeek = () => {
+        const nextWeek = format(addWeeks(activeWeekDate, 1), "yyyy-MM-dd");
+        if (onNavigateWeek) {
+            onNavigateWeek(nextWeek);
+            return;
+        }
         router.push(weekParamFor(addWeeks(activeWeekDate, 1)));
     };
     const handleCurrentWeek = () => {
+        const currentWeek = format(startOfWeek(new Date(), { weekStartsOn: 1 }), "yyyy-MM-dd");
+        if (onNavigateWeek) {
+            onNavigateWeek(currentWeek);
+            return;
+        }
         router.push(`/?tab=command-center`);
     };
 
@@ -93,6 +120,17 @@ export function CommandCenter({ tasks, timeEntries, activeWeekStr, dbConfig }: C
     const activeMonthStartMs = activeMonthStartDate.getTime();
     const activeMonthEndMs = activeMonthEndDate.getTime();
     const activeMonthLabel = format(activeMonthStartDate, "MMMM yyyy");
+    const activeMonthProgress = useMemo(() => {
+        const daysInMonth = Math.max(1, activeMonthEndDate.getDate());
+        const now = new Date();
+        const referenceDate = isCurrentWeek
+            ? now
+            : activeWeekDate > now
+                ? activeMonthStartDate
+                : activeMonthEndDate;
+        const dayOfMonth = Math.min(daysInMonth, Math.max(1, referenceDate.getDate()));
+        return dayOfMonth / daysInMonth;
+    }, [activeMonthEndDate, activeMonthStartDate, activeWeekDate, isCurrentWeek]);
 
     const activeWeekTimeEntries = useMemo(() => {
         return timeEntries.filter((entry) => {
@@ -113,6 +151,9 @@ export function CommandCenter({ tasks, timeEntries, activeWeekStr, dbConfig }: C
         return activeWeekTimeEntries.reduce((acc, entry) => acc + (Number(entry.duration) || 0), 0);
     }, [activeWeekTimeEntries]);
     const totalBilledHrs = totalBilledMs / (1000 * 60 * 60);
+    const monthToDateBilledHrs = useMemo(() => {
+        return activeMonthTimeEntries.reduce((acc, entry) => acc + ((Number(entry.duration) || 0) / (1000 * 60 * 60)), 0);
+    }, [activeMonthTimeEntries]);
 
     // Gap calculations
     const gapToBase = Math.max(0, baseTarget - totalBilledHrs);
@@ -149,6 +190,17 @@ export function CommandCenter({ tasks, timeEntries, activeWeekStr, dbConfig }: C
         }
         return map;
     });
+
+    const clientDirectoryById = useMemo(() => {
+        const map = new Map<string, any>();
+        const rows = Array.isArray(dbConfig?.clientDirectory) ? dbConfig.clientDirectory : [];
+        rows.forEach((row: any) => {
+            const id = String(row?.id ?? "").trim();
+            if (!id) return;
+            map.set(id, row);
+        });
+        return map;
+    }, [dbConfig?.clientDirectory]);
 
     const clients = useMemo(() => {
         const map = new Map<string, { id: string; name: string; orderIndex: number }>();
@@ -308,57 +360,181 @@ export function CommandCenter({ tasks, timeEntries, activeWeekStr, dbConfig }: C
         return Array.isArray(dbConfig?.weeklyTrend) ? dbConfig.weeklyTrend : [];
     }, [dbConfig]);
 
-    const weekLookup = useMemo(() => {
-        const map = new Map<string, { totalHours: number }>();
-        weeklyTrend.forEach((row: any) => {
-            map.set(row.weekStart, { totalHours: Number(row.totalHours || 0) });
-        });
-        return map;
-    }, [weeklyTrend]);
+    const monthlyBaseTarget = useMemo(() => {
+        return weeklyTrend.reduce((sum: number, row: any) => {
+            const weekStartMs = new Date(`${String(row?.weekStart ?? "")}T00:00:00`).getTime();
+            if (!Number.isFinite(weekStartMs) || weekStartMs < activeMonthStartMs || weekStartMs > activeMonthEndMs) {
+                return sum;
+            }
+            return sum + Number(row?.baseTarget ?? 0);
+        }, 0);
+    }, [activeMonthEndMs, activeMonthStartMs, weeklyTrend]);
+
+    const monthPacingTarget = monthlyBaseTarget * activeMonthProgress;
+    const monthPacingStatus = monthToDateBilledHrs >= monthPacingTarget ? "ON TRACK" : "BEHIND";
+    const monthPacingStatusClass = monthToDateBilledHrs >= monthPacingTarget ? "text-emerald-400" : "text-amber-300";
+    const monthProgressLabel = `${Math.round(activeMonthProgress * 100)}% THROUGH MONTH`;
 
     const previousWeekStr = format(subWeeks(activeWeekDate, 1), "yyyy-MM-dd");
     const previousWeekDate = subWeeks(activeWeekDate, 1);
     const previousWeekPeriodLabel = `${format(previousWeekDate, "MM/dd")} to ${format(addDays(previousWeekDate, 4), "MM/dd")}`;
-    const thisWeekHours = weekLookup.get(activeWeekStr)?.totalHours ?? totalBilledHrs;
-    const lastWeekHours = weekLookup.get(previousWeekStr)?.totalHours ?? 0;
-    const thisWeekBaseTarget = Number(dbConfig?.weekConfig?.baseTarget ?? 350);
-    const thisWeekStretchTarget = Number(dbConfig?.weekConfig?.stretchTarget ?? 400);
-    const lastWeekTrendRow = weeklyTrend.find((row: any) => row.weekStart === previousWeekStr);
-    const lastWeekBaseTarget = Number(lastWeekTrendRow?.baseTarget ?? 350);
-    const lastWeekStretchTarget = Number(lastWeekTrendRow?.stretchTarget ?? 400);
 
-    const billableCapacityTotal = useMemo(() => {
-        const configuredValues = Object.values(consultantConfigs).map((cfg: any) => Number(cfg.billableCapacity || 0));
-        return configuredValues.reduce((sum, hrs) => sum + hrs, 0);
-    }, [consultantConfigs]);
+    const taskScopeLabelsByType = useMemo(() => {
+        const listLabels = new Map<string, string>();
+        const folderLabels = new Map<string, string>();
+        tasks.forEach((task) => {
+            const listId = String(task?.list?.id ?? "").trim();
+            const listName = String(task?.list?.name ?? "").trim();
+            const folderId = String(task?.folder?.id ?? "").trim();
+            const folderName = String(task?.folder?.name ?? "").trim();
+            if (listId && listName && !listLabels.has(listId)) listLabels.set(listId, listName);
+            if (folderId && folderName && !folderLabels.has(folderId)) folderLabels.set(folderId, folderName);
+        });
+        return { listLabels, folderLabels };
+    }, [tasks]);
 
-    const previousBillableCapacityTotal = useMemo(() => {
-        const configuredValues = Object.values(previousConsultantConfigs).map((cfg: any) => Number(cfg.billableCapacity || 0));
-        return configuredValues.reduce((sum, hrs) => sum + hrs, 0);
-    }, [previousConsultantConfigs]);
+    const buildCapacityHeaderMetrics = useMemo(() => {
+        return (payload: any, consultantConfigMap: Record<number, any>, rollups: any[] = []): CapacityHeaderMetrics => {
+            const resources = (Array.isArray(payload?.resources) ? payload.resources : []).filter((resource: any) => !Boolean(resource?.removed));
+            const rows = Array.isArray(payload?.rows) ? payload.rows : [];
 
-    const thisWeekInitialForecast = useMemo(() => {
-        return clients.reduce((sum, client) => {
-            const cfg = clientConfigs[client.id];
-            const fallbackTotal = Number(cfg?.mtHrs ?? 0) + Number(cfg?.wPlusHrs ?? 0);
-            const idKey = normalizeName(client.id);
-            const nameKey = normalizeName(client.name);
-            const capacityTotal = capacityHoursByClientKey.get(idKey) ?? capacityHoursByClientKey.get(nameKey);
-            return sum + Number(capacityTotal ?? fallbackTotal);
-        }, 0);
-    }, [clients, clientConfigs, capacityHoursByClientKey]);
+            const billableByName = new Map<string, number>();
+            Object.entries(consultantConfigMap || {}).forEach(([consultantId, cfg]: any) => {
+                const consultantIdNum = Number(consultantId);
+                const consultantName = String(
+                    resources.find((resource: any) => Number(resource?.consultantId ?? 0) === consultantIdNum)?.name
+                    ?? ""
+                ).trim();
+                const billableCapacity = Number(cfg?.billableCapacity ?? 40);
+                const fullKey = normalizeName(consultantName);
+                const firstKey = normalizeName(consultantName.split(/\s+/)[0] || "");
+                if (fullKey) billableByName.set(fullKey, billableCapacity);
+                if (firstKey && !billableByName.has(firstKey)) billableByName.set(firstKey, billableCapacity);
+            });
 
-    const lastWeekInitialForecast = useMemo(() => {
-        return Object.values(previousClientConfigs).reduce((sum: number, cfg: any) => {
-            return sum + Number(cfg?.mtHrs ?? 0) + Number(cfg?.wPlusHrs ?? 0);
-        }, 0);
-    }, [previousClientConfigs]);
-    const thisWeekBillableTarget = leads.reduce((sum, lead) => sum + Number(leadTargets[lead] || 0), 0);
-    const lastWeekBillableTarget = leads.reduce((sum, lead) => sum + Number(previousLeadTargets[lead] || 0), 0);
-    const lastWeekGapToTarget = Math.max(0, lastWeekBaseTarget - lastWeekHours);
-    const thisWeekGapToTarget = Math.max(0, thisWeekBaseTarget - thisWeekHours);
-    const lastWeekGapToWkTarget = Math.max(0, lastWeekBillableTarget - lastWeekHours);
-    const thisWeekGapToWkTarget = Math.max(0, thisWeekBillableTarget - thisWeekHours);
+            const totalCapacity = resources.reduce((sum: number, resource: any) => {
+                const consultantId = Number(resource?.consultantId ?? 0);
+                if (consultantId > 0 && consultantConfigMap?.[consultantId]) {
+                    return sum + Number(consultantConfigMap[consultantId]?.billableCapacity ?? 40);
+                }
+                const fullKey = normalizeName(String(resource?.name ?? ""));
+                const firstKey = normalizeName(String(resource?.name ?? "").split(/\s+/)[0] || "");
+                return sum + Number(billableByName.get(fullKey) ?? billableByName.get(firstKey) ?? 0);
+            }, 0);
+
+            const planned = rows.reduce((sum: number, row: any) => {
+                return sum + resources.reduce((rowSum: number, resource: any) => {
+                    return rowSum + Number(row?.allocations?.[resource.id]?.hours ?? 0);
+                }, 0);
+            }, 0);
+
+            const wkMinTotal = rows.reduce((sum: number, row: any) => sum + Number(row?.wkMin ?? 0), 0);
+            const wkMaxTotal = rows.reduce((sum: number, row: any) => sum + Number(row?.wkMax ?? 0), 0);
+
+            const actuals = (Array.isArray(rollups) ? rollups : []).reduce((sum: number, rollup: any) => {
+                const assigneeFullKey = normalizeName(String(rollup?.assignee ?? ""));
+                const assigneeFirstKey = normalizeName(String(rollup?.assignee ?? "").split(/\s+/)[0] || "");
+                const consultantMatch = resources.some((resource: any) => {
+                    const resourceFullKey = normalizeName(String(resource?.name ?? ""));
+                    const resourceFirstKey = normalizeName(String(resource?.name ?? "").split(/\s+/)[0] || "");
+                    return (
+                        (resourceFullKey && assigneeFullKey === resourceFullKey)
+                        || (resourceFirstKey && assigneeFullKey === resourceFirstKey)
+                        || (resourceFullKey && assigneeFirstKey === resourceFullKey)
+                        || (resourceFirstKey && assigneeFirstKey === resourceFirstKey)
+                    );
+                });
+                if (!consultantMatch) return sum;
+
+                const scopeLabels = (() => {
+                    const scopeType = String(rollup?.scopeType ?? "");
+                    const scopeId = String(rollup?.scopeId ?? "");
+                    if (scopeType === "list") {
+                        return [taskScopeLabelsByType.listLabels.get(scopeId) ?? scopeId].filter(Boolean);
+                    }
+                    if (scopeType === "folder") {
+                        return [taskScopeLabelsByType.folderLabels.get(scopeId) ?? scopeId].filter(Boolean);
+                    }
+                    return [scopeId].filter(Boolean);
+                })();
+
+                const rowMatch = rows.some((row: any) => {
+                    const rowClientKey = normalizeName(String(row?.client ?? ""));
+                    const rowIdKey = normalizeName(String(row?.id ?? ""));
+                    return scopeLabels.some((label) => {
+                        const labelKey = normalizeName(label);
+                        return labelKey.length > 0 && (
+                            labelKey === rowClientKey
+                            || labelKey === rowIdKey
+                            || labelKey.includes(rowClientKey)
+                            || rowClientKey.includes(labelKey)
+                        );
+                    });
+                });
+
+                if (!rowMatch) return sum;
+                return sum + Number(rollup?.hours ?? 0);
+            }, 0);
+
+            return {
+                totalCapacity: Number(totalCapacity.toFixed(1)),
+                planned: Number(planned.toFixed(1)),
+                actuals: Number(actuals.toFixed(1)),
+                wkMinTotal: Number(wkMinTotal.toFixed(1)),
+                wkMaxTotal: Number(wkMaxTotal.toFixed(1)),
+                gapToMin: Number((planned - wkMinTotal).toFixed(1)),
+            };
+        };
+    }, [taskScopeLabelsByType]);
+
+    const capacityGridWeeksByWeek = useMemo(() => {
+        const map = new Map<string, any>();
+        const rows = Array.isArray(dbConfig?.capacityGridConfigsForYear) ? dbConfig.capacityGridConfigsForYear : [];
+        rows.forEach((row: any) => {
+            const weekKey = String(row?.week ?? "");
+            if (!weekKey) return;
+            map.set(weekKey, row?.payload ?? null);
+        });
+        if (dbConfig?.capacityGridConfig) {
+            map.set(activeWeekStr, dbConfig.capacityGridConfig);
+        }
+        return map;
+    }, [activeWeekStr, dbConfig]);
+
+    const currentCapacityMetrics = useMemo(
+        () => buildCapacityHeaderMetrics(
+            dbConfig?.capacityGridConfig,
+            consultantConfigs,
+            Array.isArray(dbConfig?.taskBillableRollups) ? dbConfig.taskBillableRollups : []
+        ),
+        [buildCapacityHeaderMetrics, consultantConfigs, dbConfig]
+    );
+
+    const previousCapacityMetrics = useMemo(
+        () => buildCapacityHeaderMetrics(
+            capacityGridWeeksByWeek.get(previousWeekStr),
+            previousConsultantConfigs,
+            Array.isArray(dbConfig?.previousTaskBillableRollups) ? dbConfig.previousTaskBillableRollups : []
+        ),
+        [buildCapacityHeaderMetrics, capacityGridWeeksByWeek, dbConfig, previousConsultantConfigs, previousWeekStr]
+    );
+
+    const buildWeekAtGlanceCards = (metrics: CapacityHeaderMetrics) => ([
+        { label: "Consultant Total Capacity", value: metrics.totalCapacity, accent: "text-white" },
+        { label: "Planned", value: metrics.planned, accent: "text-white" },
+        { label: "Actuals", value: metrics.actuals, accent: "text-white" },
+        { label: "WK Min Total", value: metrics.wkMinTotal, accent: "text-white" },
+        { label: "WK Max Total", value: metrics.wkMaxTotal, accent: "text-white" },
+        {
+            label: "Gap vs WK Min",
+            value: metrics.gapToMin,
+            accent: metrics.gapToMin >= 0 ? "text-white" : "text-slate-400",
+            lane: metrics.gapToMin >= 0 ? "" : "bg-slate-500/10",
+        },
+    ]);
+
+    const previousWeekCards = buildWeekAtGlanceCards(previousCapacityMetrics);
+    const currentWeekCards = buildWeekAtGlanceCards(currentCapacityMetrics);
 
     return (
         <div className="flex flex-col space-y-8 pb-32 px-1">
@@ -371,13 +547,13 @@ export function CommandCenter({ tasks, timeEntries, activeWeekStr, dbConfig }: C
                         </h2>
 
                         <div className="flex items-center bg-surface border border-border rounded overflow-hidden">
-                            <button onClick={handlePrevWeek} className="px-2 py-1 hover:bg-surface-hover text-text-muted transition-colors">
+                            <button disabled={isNavigationBlocked} onClick={handlePrevWeek} className="px-2 py-1 hover:bg-surface-hover text-text-muted transition-colors disabled:opacity-50">
                                 <ChevronLeft className="w-4 h-4" />
                             </button>
-                            <button onClick={handleCurrentWeek} className="px-3 py-1 text-xs font-medium text-white hover:bg-surface-hover transition-colors border-l border-r border-border">
+                            <button disabled={isWeekLoading} onClick={handleCurrentWeek} className="px-3 py-1 text-xs font-medium text-white hover:bg-surface-hover transition-colors border-l border-r border-border disabled:opacity-50">
                                 {isCurrentWeek ? "Current Week" : format(activeWeekDate, "MMM d, yyyy")}
                             </button>
-                            <button onClick={handleNextWeek} className="px-2 py-1 hover:bg-surface-hover text-text-muted transition-colors">
+                            <button disabled={isNavigationBlocked} onClick={handleNextWeek} className="px-2 py-1 hover:bg-surface-hover text-text-muted transition-colors disabled:opacity-50">
                                 <ChevronRight className="w-4 h-4" />
                             </button>
                         </div>
@@ -399,42 +575,13 @@ export function CommandCenter({ tasks, timeEntries, activeWeekStr, dbConfig }: C
                         <div className="px-5 py-3 border-b border-border/50 bg-surface/30">
                             <h3 className="text-sm font-semibold text-text-main">LAST WEEK AT A GLANCE — {previousWeekPeriodLabel}</h3>
                         </div>
-                        <div className="grid grid-cols-1 md:grid-cols-4 lg:grid-cols-8 divide-y md:divide-y-0 md:divide-x divide-border/40">
-                            <div className="p-4">
-                                <div className="text-[11px] uppercase text-text-muted">Initial Forecast (Mon)</div>
-                                <div className="text-3xl font-bold text-white mt-1">{lastWeekInitialForecast.toFixed(1)}</div>
-                            </div>
-                            <div className="p-4">
-                                <div className="text-[11px] uppercase text-text-muted">Total Billed</div>
-                                <div className="text-3xl font-bold text-white mt-1">{lastWeekHours.toFixed(1)}</div>
-                            </div>
-                            <div className="p-4">
-                                <div className="text-[11px] uppercase text-text-muted">Gap to Target</div>
-                                <div className={cn("text-3xl font-bold mt-1", lastWeekGapToTarget === 0 ? "text-emerald-400" : "text-red-400")}>{lastWeekGapToTarget.toFixed(1)}</div>
-                            </div>
-                            <div className="p-4">
-                                <div className="text-[11px] uppercase text-text-muted">Gap to Stretch</div>
-                                <div className="text-3xl font-bold mt-1 text-red-400">{Math.max(0, lastWeekStretchTarget - lastWeekHours).toFixed(1)}</div>
-                            </div>
-                            <div className="p-4">
-                                <div className="text-[11px] uppercase text-text-muted">M/T Pace</div>
-                                <div className="text-3xl font-bold text-white mt-1">{lastWeekBaseTarget > 0 ? ((lastWeekHours / lastWeekBaseTarget) * 100).toFixed(0) : "0"}%</div>
-                            </div>
-                            <div className="p-4">
-                                <div className="text-[11px] uppercase text-text-muted">Billable Capacity</div>
-                                <div className="text-3xl font-bold text-white mt-1">{previousBillableCapacityTotal.toFixed(1)}</div>
-                            </div>
-                            <div className="p-4">
-                                <div className="text-[11px] uppercase text-text-muted">Billable Target</div>
-                                <div className="text-3xl font-bold text-white mt-1">{lastWeekBillableTarget.toFixed(1)}</div>
-                            </div>
-                            <div className={cn("p-4", lastWeekGapToWkTarget === 0 ? "bg-emerald-500/10" : "bg-red-500/10")}>
-                                <div className="text-[11px] uppercase text-text-muted">Gap to Wk Target</div>
-                                <div className={cn("text-3xl font-bold mt-1", lastWeekGapToWkTarget === 0 ? "text-emerald-400" : "text-red-400")}>{lastWeekGapToWkTarget.toFixed(1)}</div>
-                            </div>
-                        </div>
-                        <div className="px-5 py-2 border-t border-border/40 text-xs text-text-muted bg-surface/10">
-                            {lastWeekBaseTarget > 0 ? ((lastWeekHours / lastWeekBaseTarget) * 100).toFixed(0) : "0"}% of {lastWeekBaseTarget.toFixed(0)} hr target
+                        <div className="grid grid-cols-1 md:grid-cols-3 xl:grid-cols-6 divide-y md:divide-y-0 md:divide-x divide-border/40">
+                            {previousWeekCards.map((card) => (
+                                <div key={card.label} className={cn("p-4", card.lane)}>
+                                    <div className="text-[11px] uppercase text-text-muted">{card.label}</div>
+                                    <div className={cn("mt-1 text-3xl font-bold", card.accent)}>{card.value.toFixed(1)}</div>
+                                </div>
+                            ))}
                         </div>
                     </div>
 
@@ -442,43 +589,35 @@ export function CommandCenter({ tasks, timeEntries, activeWeekStr, dbConfig }: C
                         <div className="px-5 py-3 border-b border-border/50 bg-surface/30">
                             <h3 className="text-sm font-semibold text-text-main">THIS WEEK AT A GLANCE</h3>
                         </div>
-                        <div className="grid grid-cols-1 md:grid-cols-4 lg:grid-cols-8 divide-y md:divide-y-0 md:divide-x divide-border/40">
-                            <div className="p-4">
-                                <div className="text-[11px] uppercase text-text-muted">Initial Forecast (Mon)</div>
-                                <div className="text-3xl font-bold text-white mt-1">{thisWeekInitialForecast.toFixed(1)}</div>
-                            </div>
-                            <div className="p-4">
-                                <div className="text-[11px] uppercase text-text-muted">Total Billable by Fri</div>
-                                <div className="text-3xl font-bold text-white mt-1">{thisWeekHours.toFixed(1)}</div>
-                            </div>
-                            <div className="p-4">
-                                <div className="text-[11px] uppercase text-text-muted">Gap to Target</div>
-                                <div className={cn("text-3xl font-bold mt-1", thisWeekGapToTarget === 0 ? "text-emerald-400" : "text-red-400")}>{thisWeekGapToTarget.toFixed(1)}</div>
-                            </div>
-                            <div className="p-4">
-                                <div className="text-[11px] uppercase text-text-muted">Gap to Stretch</div>
-                                <div className="text-3xl font-bold mt-1 text-red-400">{Math.max(0, thisWeekStretchTarget - thisWeekHours).toFixed(1)}</div>
-                            </div>
-                            <div className="p-4">
-                                <div className="text-[11px] uppercase text-text-muted">M/T Pace</div>
-                                <div className="text-3xl font-bold text-white mt-1">{thisWeekBaseTarget > 0 ? ((thisWeekHours / thisWeekBaseTarget) * 100).toFixed(0) : "0"}%</div>
-                            </div>
-                            <div className="p-4">
-                                <div className="text-[11px] uppercase text-text-muted">Billable Capacity</div>
-                                <div className="text-3xl font-bold text-white mt-1">{billableCapacityTotal.toFixed(1)}</div>
-                            </div>
-                            <div className="p-4">
-                                <div className="text-[11px] uppercase text-text-muted">Billable Target</div>
-                                <div className="text-3xl font-bold text-white mt-1">{thisWeekBillableTarget.toFixed(1)}</div>
-                            </div>
-                            <div className={cn("p-4", thisWeekGapToWkTarget === 0 ? "bg-emerald-500/10" : "bg-red-500/10")}>
-                                <div className="text-[11px] uppercase text-text-muted">Gap to Wk Target</div>
-                                <div className={cn("text-3xl font-bold mt-1", thisWeekGapToWkTarget === 0 ? "text-emerald-400" : "text-red-400")}>{thisWeekGapToWkTarget.toFixed(1)}</div>
-                            </div>
+                        <div className="grid grid-cols-1 md:grid-cols-3 xl:grid-cols-6 divide-y md:divide-y-0 md:divide-x divide-border/40">
+                            {currentWeekCards.map((card) => (
+                                <div key={card.label} className={cn("p-4", card.lane)}>
+                                    <div className="text-[11px] uppercase text-text-muted">{card.label}</div>
+                                    <div className={cn("mt-1 text-3xl font-bold", card.accent)}>{card.value.toFixed(1)}</div>
+                                </div>
+                            ))}
                         </div>
-                        <div className="px-5 py-2 border-t border-border/40 text-xs text-text-muted bg-surface/10">
-                            {thisWeekBaseTarget > 0 ? ((thisWeekHours / thisWeekBaseTarget) * 100).toFixed(0) : "0"}% of {thisWeekBaseTarget.toFixed(0)} hr target
+                </div>
+
+                <div className="overflow-hidden rounded-2xl border border-border/60 bg-[linear-gradient(180deg,rgba(39,32,74,0.92)_0%,rgba(27,24,49,0.96)_100%)] shadow-[0_18px_50px_rgba(0,0,0,0.24)]">
+                    <div className="flex items-center justify-between border-b border-white/10 px-6 py-4">
+                        <h3 className="text-lg font-semibold text-white">MONTH AT A GLANCE — {activeMonthLabel}</h3>
+                        <div className="text-[11px] font-semibold uppercase tracking-[0.22em] text-indigo-200/80">{monthProgressLabel}</div>
+                    </div>
+                    <div className="grid grid-cols-1 divide-y divide-white/10 md:grid-cols-[1fr_1fr_0.9fr] md:divide-x md:divide-y-0">
+                        <div className="px-6 py-8">
+                            <div className="text-[12px] font-semibold uppercase tracking-[0.18em] text-indigo-200/70">Month To Date Billed</div>
+                            <div className="mt-4 text-5xl font-bold leading-none text-white">{monthToDateBilledHrs.toFixed(1)}</div>
                         </div>
+                        <div className="px-6 py-8">
+                            <div className="text-[12px] font-semibold uppercase tracking-[0.18em] text-indigo-200/70">Monthly Base Target</div>
+                            <div className="mt-4 text-5xl font-bold leading-none text-white">{monthlyBaseTarget.toFixed(0)}</div>
+                        </div>
+                        <div className="bg-white/[0.02] px-6 py-8">
+                            <div className="text-[12px] font-semibold uppercase tracking-[0.18em] text-indigo-200/70">Month Pacing Status</div>
+                            <div className={cn("mt-4 text-5xl font-bold leading-none", monthPacingStatusClass)}>{monthPacingStatus}</div>
+                        </div>
+                    </div>
                 </div>
             </div>
 
@@ -530,12 +669,13 @@ export function CommandCenter({ tasks, timeEntries, activeWeekStr, dbConfig }: C
 
                             rows.forEach((row: any, idx: number) => {
                                 const rowId = String(row?.id ?? `row-${idx + 1}`);
+                                const clientDirectory = clientDirectoryById.get(rowId);
                                 const existing = monthCapacityRows.get(rowId) ?? {
-                                    client: String(row?.client ?? "Client"),
-                                    team: Number(row?.team ?? clientConfigs[rowId]?.team ?? 0),
-                                    sa: String(row?.teamSa ?? ""),
-                                    dealType: String(row?.dealType ?? ""),
-                                    wkMax: Number(row?.wkMax ?? 0),
+                                    client: String(clientDirectory?.name ?? row?.client ?? "Client"),
+                                    team: Number(clientDirectory?.team ?? row?.team ?? clientConfigs[rowId]?.team ?? 0),
+                                    sa: String(clientDirectory?.sa ?? row?.teamSa ?? ""),
+                                    dealType: String(clientDirectory?.dealType ?? row?.dealType ?? ""),
+                                    wkMax: Number(clientDirectory?.max ?? row?.wkMax ?? 0),
                                     monthlyMax: 0,
                                     plannedHours: 0,
                                 };
@@ -545,12 +685,12 @@ export function CommandCenter({ tasks, timeEntries, activeWeekStr, dbConfig }: C
                                     return sum + getAllocationHours(allocations?.[resource.id]);
                                 }, 0);
 
-                                existing.client = existing.client || String(row?.client ?? rowId);
-                                existing.team = Number(existing.team || row?.team || clientConfigs[rowId]?.team || 0);
-                                existing.sa = existing.sa || String(row?.teamSa ?? "");
-                                existing.dealType = existing.dealType || String(row?.dealType ?? "");
-                                existing.wkMax = Number(existing.wkMax || row?.wkMax || 0);
-                                existing.monthlyMax += Number(row?.wkMax ?? 0);
+                                existing.client = existing.client || String(clientDirectory?.name ?? row?.client ?? rowId);
+                                existing.team = Number(existing.team || clientDirectory?.team || row?.team || clientConfigs[rowId]?.team || 0);
+                                existing.sa = existing.sa || String(clientDirectory?.sa ?? row?.teamSa ?? "");
+                                existing.dealType = existing.dealType || String(clientDirectory?.dealType ?? row?.dealType ?? "");
+                                existing.wkMax = Number(existing.wkMax || clientDirectory?.max || row?.wkMax || 0);
+                                existing.monthlyMax += Number(clientDirectory?.max ?? row?.wkMax ?? 0);
                                 existing.plannedHours += Number(rowPlannedHours ?? 0);
 
                                 monthCapacityRows.set(rowId, existing);
@@ -560,6 +700,7 @@ export function CommandCenter({ tasks, timeEntries, activeWeekStr, dbConfig }: C
                         const cptRows: ClientPaceTrackerRow[] = capacityGridRows.map((row: any, idx: number) => {
                             const rowId = String(row?.id ?? `row-${idx + 1}`);
                             const monthlyCapacity = monthCapacityRows.get(rowId);
+                            const clientDirectory = clientDirectoryById.get(rowId);
                             const idKey = normalizeName(rowId);
                             const nameKey = normalizeName(String(row?.client ?? ""));
                             const billedHours = Number(
@@ -567,20 +708,27 @@ export function CommandCenter({ tasks, timeEntries, activeWeekStr, dbConfig }: C
                                 ?? billedByClient.get(nameKey)
                                 ?? 0
                             );
-                            const wkMax = Number(row?.wkMax ?? monthlyCapacity?.wkMax ?? 0);
+                            const wkMax = Number(clientDirectory?.max ?? row?.wkMax ?? monthlyCapacity?.wkMax ?? 0);
                             const monthlyMax = Number(monthlyCapacity?.monthlyMax ?? 0);
                             const plannedHours = Number(monthlyCapacity?.plannedHours ?? 0);
                             const isPlannedOverMonthlyMax = monthlyMax > 0 && plannedHours > monthlyMax;
                             const isOverMonthlyMax = monthlyMax > 0 && billedHours > monthlyMax;
-                            const statusLabel = isOverMonthlyMax ? "Billed Over Max" : isPlannedOverMonthlyMax ? "Planned Over Max" : "OK";
+                            const isUnderWeeklyMax = wkMax > 0 && plannedHours <= wkMax;
+                            const statusLabel = isOverMonthlyMax
+                                ? "Billed Over Max"
+                                : isPlannedOverMonthlyMax
+                                    ? "Planned Over Max"
+                                    : isUnderWeeklyMax
+                                        ? "Under Wk Max"
+                                        : "OK";
                             const teamFromConfig = clientConfigs[rowId]?.team;
 
                             return {
                                 id: rowId,
-                                team: Number(row?.team ?? teamFromConfig ?? monthlyCapacity?.team ?? 0),
-                                client: String(row?.client ?? monthlyCapacity?.client ?? "Client"),
-                                sa: String(row?.teamSa ?? monthlyCapacity?.sa ?? ""),
-                                dealType: String(row?.dealType ?? monthlyCapacity?.dealType ?? ""),
+                                team: Number(clientDirectory?.team ?? row?.team ?? teamFromConfig ?? monthlyCapacity?.team ?? 0),
+                                client: String(clientDirectory?.name ?? row?.client ?? monthlyCapacity?.client ?? "Client"),
+                                sa: String(clientDirectory?.sa ?? row?.teamSa ?? monthlyCapacity?.sa ?? ""),
+                                dealType: String(clientDirectory?.dealType ?? row?.dealType ?? monthlyCapacity?.dealType ?? ""),
                                 wkMax,
                                 plannedHours,
                                 billedHours,

@@ -13,6 +13,8 @@ interface CapacityTrendsProps {
     consultantConfigsForYear: Array<{ week: string; consultantId: number; billableCapacity?: number | null }>;
     consultantConfigsCurrentWeek?: Array<{ consultantId: number; billableCapacity?: number | null }>;
     capacityGridConfigsForYear: CapacityGridWeekRecord[];
+    onNavigateWeek?: (nextWeek: string) => void;
+    isWeekLoading?: boolean;
 }
 
 function normalizeName(value: string) {
@@ -40,11 +42,14 @@ export function CapacityTrends({
     consultantConfigsForYear,
     consultantConfigsCurrentWeek = [],
     capacityGridConfigsForYear,
+    onNavigateWeek,
+    isWeekLoading = false,
 }: CapacityTrendsProps) {
     const router = useRouter();
     const [isWeekNavLocked, setIsWeekNavLocked] = useState(false);
     const navUnlockTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const activeWeekDate = new Date(activeWeekStr + "T00:00:00");
+    const isNavigationBlocked = !onNavigateWeek && (isWeekNavLocked || isWeekLoading);
     const currentWeekStart = startOfWeek(new Date(), { weekStartsOn: 1 });
     const isCurrentWeek = activeWeekStr === format(currentWeekStart, "yyyy-MM-dd");
     const weekNumber = format(activeWeekDate, "II");
@@ -52,18 +57,22 @@ export function CapacityTrends({
 
     const weekParamFor = (nextDate: Date) => `/?week=${format(nextDate, "yyyy-MM-dd")}&tab=capacity-trends`;
     const navigateToWeek = (nextDate: Date | null) => {
-        if (isWeekNavLocked) return;
+        if (isNavigationBlocked) return;
         const currentWeekStr = format(startOfWeek(new Date(), { weekStartsOn: 1 }), "yyyy-MM-dd");
         if (nextDate === null && activeWeekStr === currentWeekStr) return;
         if (nextDate && format(nextDate, "yyyy-MM-dd") === activeWeekStr) return;
 
         const href = nextDate ? weekParamFor(nextDate) : "/?tab=capacity-trends";
-        setIsWeekNavLocked(true);
-        router.push(href);
-        navUnlockTimerRef.current = setTimeout(() => {
-            setIsWeekNavLocked(false);
-            navUnlockTimerRef.current = null;
-        }, 500);
+        if (onNavigateWeek) {
+            onNavigateWeek(nextDate ? format(nextDate, "yyyy-MM-dd") : currentWeekStr);
+        } else {
+            setIsWeekNavLocked(true);
+            router.push(href);
+            navUnlockTimerRef.current = setTimeout(() => {
+                setIsWeekNavLocked(false);
+                navUnlockTimerRef.current = null;
+            }, 500);
+        }
     };
     const handlePrevWeek = () => navigateToWeek(subWeeks(activeWeekDate, 1));
     const handleNextWeek = () => navigateToWeek(addWeeks(activeWeekDate, 1));
@@ -283,7 +292,7 @@ export function CapacityTrends({
                     <div className="flex items-center rounded-md border border-border/70 overflow-hidden bg-surface/20">
                         <button
                             onClick={handlePrevWeek}
-                            disabled={isWeekNavLocked}
+                            disabled={isNavigationBlocked}
                             className="h-9 w-9 flex items-center justify-center text-text-muted hover:text-white hover:bg-surface-hover transition-colors border-r border-border/70"
                             aria-label="Previous week"
                         >
@@ -295,7 +304,7 @@ export function CapacityTrends({
                         </div>
                         <button
                             onClick={handleNextWeek}
-                            disabled={isWeekNavLocked}
+                            disabled={isNavigationBlocked}
                             className="h-9 w-9 flex items-center justify-center text-text-muted hover:text-white hover:bg-surface-hover transition-colors border-l border-border/70"
                             aria-label="Next week"
                         >
@@ -304,7 +313,7 @@ export function CapacityTrends({
                     </div>
                     <button
                         onClick={handleCurrentWeek}
-                        disabled={isWeekNavLocked}
+                        disabled={isNavigationBlocked}
                         className={cn(
                             "h-9 px-3 rounded-md border border-border/70 text-xs font-semibold transition-colors",
                             isCurrentWeek ? "text-white bg-surface/50" : "text-text-muted hover:text-white hover:bg-surface-hover"

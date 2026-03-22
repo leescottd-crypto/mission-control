@@ -18,26 +18,50 @@ interface TrendsProps {
         vsTarget?: number;
         vsStretch?: number;
     }>;
+    onNavigateWeek?: (nextWeek: string) => void;
+    isWeekLoading?: boolean;
 }
 
 function formatSigned(value: number) {
     return `${value >= 0 ? "+" : ""}${value.toFixed(1)}`;
 }
 
-export function Trends({ activeWeekStr, weeklyTrend }: TrendsProps) {
+export function Trends({ activeWeekStr, weeklyTrend, onNavigateWeek, isWeekLoading = false }: TrendsProps) {
     const router = useRouter();
     const activeWeekDate = new Date(activeWeekStr + "T00:00:00");
     const currentWeekStart = startOfWeek(new Date(), { weekStartsOn: 1 });
     const currentWeekKey = format(currentWeekStart, "yyyy-MM-dd");
     const includeCurrentWeek = new Date().getDay() >= 3; // Wed (3) onward
     const isCurrentWeek = activeWeekStr === format(currentWeekStart, "yyyy-MM-dd");
+    const isNavigationBlocked = !onNavigateWeek && isWeekLoading;
     const weekNumber = format(activeWeekDate, "II");
     const weekRangeLabel = `${format(activeWeekDate, "MMM d")} to ${format(addDays(activeWeekDate, 4), "MMM d")}`;
 
     const weekParamFor = (nextDate: Date) => `/?week=${format(nextDate, "yyyy-MM-dd")}&tab=trends`;
-    const handlePrevWeek = () => router.push(weekParamFor(subWeeks(activeWeekDate, 1)));
-    const handleNextWeek = () => router.push(weekParamFor(addWeeks(activeWeekDate, 1)));
-    const handleCurrentWeek = () => router.push("/?tab=trends");
+    const handlePrevWeek = () => {
+        const nextWeek = format(subWeeks(activeWeekDate, 1), "yyyy-MM-dd");
+        if (onNavigateWeek) {
+            onNavigateWeek(nextWeek);
+            return;
+        }
+        router.push(weekParamFor(subWeeks(activeWeekDate, 1)));
+    };
+    const handleNextWeek = () => {
+        const nextWeek = format(addWeeks(activeWeekDate, 1), "yyyy-MM-dd");
+        if (onNavigateWeek) {
+            onNavigateWeek(nextWeek);
+            return;
+        }
+        router.push(weekParamFor(addWeeks(activeWeekDate, 1)));
+    };
+    const handleCurrentWeek = () => {
+        const currentWeek = format(startOfWeek(new Date(), { weekStartsOn: 1 }), "yyyy-MM-dd");
+        if (onNavigateWeek) {
+            onNavigateWeek(currentWeek);
+            return;
+        }
+        router.push("/?tab=trends");
+    };
 
     const rowsForDisplay = useMemo(() => {
         const activeYear = Number(activeWeekStr.slice(0, 4));
@@ -108,7 +132,8 @@ export function Trends({ activeWeekStr, weeklyTrend }: TrendsProps) {
                     <div className="flex items-center rounded-md border border-border/70 overflow-hidden bg-surface/20">
                         <button
                             onClick={handlePrevWeek}
-                            className="h-9 w-9 flex items-center justify-center text-text-muted hover:text-white hover:bg-surface-hover transition-colors border-r border-border/70"
+                            disabled={isNavigationBlocked}
+                            className="h-9 w-9 flex items-center justify-center text-text-muted hover:text-white hover:bg-surface-hover transition-colors border-r border-border/70 disabled:opacity-50"
                             aria-label="Previous week"
                         >
                             <ChevronLeft className="w-4 h-4" />
@@ -119,7 +144,8 @@ export function Trends({ activeWeekStr, weeklyTrend }: TrendsProps) {
                         </div>
                         <button
                             onClick={handleNextWeek}
-                            className="h-9 w-9 flex items-center justify-center text-text-muted hover:text-white hover:bg-surface-hover transition-colors border-l border-border/70"
+                            disabled={isNavigationBlocked}
+                            className="h-9 w-9 flex items-center justify-center text-text-muted hover:text-white hover:bg-surface-hover transition-colors border-l border-border/70 disabled:opacity-50"
                             aria-label="Next week"
                         >
                             <ChevronRight className="w-4 h-4" />
@@ -127,8 +153,9 @@ export function Trends({ activeWeekStr, weeklyTrend }: TrendsProps) {
                     </div>
                     <button
                         onClick={handleCurrentWeek}
+                        disabled={isNavigationBlocked}
                         className={cn(
-                            "h-9 px-3 rounded-md border border-border/70 text-xs font-semibold transition-colors",
+                            "h-9 px-3 rounded-md border border-border/70 text-xs font-semibold transition-colors disabled:opacity-50",
                             isCurrentWeek ? "text-white bg-surface/50" : "text-text-muted hover:text-white hover:bg-surface-hover"
                         )}
                     >

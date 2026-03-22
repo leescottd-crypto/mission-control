@@ -37,15 +37,19 @@ Optional NetSuite integration variables:
 - `NETSUITE_REALM`
 - `NETSUITE_BASE_URL`
 - `NETSUITE_HEALTH_PATH`
+- `NETSUITE_CONSULTANT_PATH`
+- `NETSUITE_SYNC_TOKEN`
 
 Authentication variables for office rollout:
 
 - `AUTH_ENABLED`
 - `NEXTAUTH_URL`
 - `NEXTAUTH_SECRET`
-- `AZURE_AD_CLIENT_ID`
-- `AZURE_AD_CLIENT_SECRET`
-- `AZURE_AD_TENANT_ID`
+- `GOOGLE_CLIENT_ID`
+- `GOOGLE_CLIENT_SECRET`
+- `AUTH_BOOTSTRAP_ADMIN_EMAIL`
+- `RESEND_API_KEY`
+- `RESEND_FROM_EMAIL`
 
 ## Health Check
 
@@ -57,13 +61,41 @@ GET /api/health
 
 The endpoint verifies that the app can reach the database.
 
+## NetSuite Consultant Sync
+
+Once NetSuite credentials are configured, you can inspect readiness with:
+
+```bash
+GET /api/integrations/netsuite/consultants/sync
+```
+
+Run a dry run:
+
+```bash
+POST /api/integrations/netsuite/consultants/sync
+{
+  "dryRun": true
+}
+```
+
+Run a real sync:
+
+```bash
+POST /api/integrations/netsuite/consultants/sync
+```
+
+If `NETSUITE_SYNC_TOKEN` is set, send it as either:
+
+- `Authorization: Bearer <token>`
+- `x-sync-token: <token>`
+
 ## Production Recommendation
 
 For office-wide use, deploy with:
 
 1. `Vercel` for the web app
 2. `Postgres` for the database
-3. `Microsoft Entra ID` for login
+3. `Google Workspace / Google OAuth` for login
 4. environment variables managed in the hosting platform
 5. uptime monitoring against `/api/health`
 
@@ -74,13 +106,14 @@ SQLite is fine for local development, but not the right long-term choice for a m
 ### Immediate
 
 1. Move `DATABASE_URL` from SQLite to managed Postgres
-2. Turn on `AUTH_ENABLED=true` once Microsoft Entra ID variables are configured
-3. Keep Prisma query logging disabled in production
-4. Deploy a shared production environment
+2. Create your first admin user or set `AUTH_BOOTSTRAP_ADMIN_EMAIL`
+3. Turn on `AUTH_ENABLED=true` once Google auth variables are configured
+4. Keep Prisma query logging disabled in production
+5. Deploy a shared production environment
 
 ### Next
 
-1. Add office authentication using Google Workspace or Microsoft Entra ID
+1. Expand role-based privilege enforcement deeper across editable screens
 2. Add background ClickUp sync so the UI reads from local data instead of pulling everything live
 3. Add backups, monitoring, and audit tracking for office edits
 
@@ -94,3 +127,5 @@ SQLite is fine for local development, but not the right long-term choice for a m
 4. Set ClickUp secrets
 5. Verify `/api/health`
 6. Test with a small pilot group before opening to the full office
+
+See the full office rollout guide in [docs/production-rollout.md](/Users/scottlee/Antigravity/MissionControl/docs/production-rollout.md).

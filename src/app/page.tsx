@@ -11,13 +11,16 @@ import {
     getWeekConfigsForYear,
     getLeadConfigs,
     getClientConfigs,
+    getClientDirectory,
     getConsultantConfigs,
+    getConsultants,
     getCapacityGridConfig,
     getConsultantConfigsForYear,
     getCapacityGridConfigsForYear,
     getEditableTaskBillableRollups,
     getTaskSidebarStructure
 } from "@/app/actions";
+import { requireAppSession } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
 
@@ -37,7 +40,13 @@ const CANONICAL_2026_WEEK_DATA: Record<string, { totalHours: number; vsTarget: n
     W14: { totalHours: 0.0, vsTarget: -350.0, vsStretch: -400.0 },
 };
 
+function normalizeConsultantNameKey(value: string) {
+    return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
 export default async function DashboardPage({ searchParams }: { searchParams: { week?: string; tab?: string; listId?: string; folderId?: string; assignee?: string } }) {
+    await requireAppSession();
+
     // Await searchParams for Next.js 15 compatibility, but fallback safely
     const sp = await Promise.resolve(searchParams);
 
@@ -82,13 +91,16 @@ export default async function DashboardPage({ searchParams }: { searchParams: { 
         weekConfigsForYear,
         leadConfigs,
         clientConfigs,
+        clientDirectory,
         consultantConfigs,
+        savedConsultants,
         consultantConfigsForYear,
         capacityGridConfigsForYear,
         previousLeadConfigs,
         previousClientConfigs,
         previousConsultantConfigs,
         initialTaskBillableRollups,
+        previousTaskBillableRollups,
         initialSidebarStructure
     ] = await Promise.all([
         getTeamTasks(),
@@ -98,19 +110,41 @@ export default async function DashboardPage({ searchParams }: { searchParams: { 
         getWeekConfigsForYear(activeYear),
         getLeadConfigs(weekStartStr),
         getClientConfigs(weekStartStr),
+        getClientDirectory(),
         getConsultantConfigs(weekStartStr),
+        getConsultants(),
         getConsultantConfigsForYear(activeYear),
         getCapacityGridConfigsForYear(activeYear),
         getLeadConfigs(previousWeekStartStr),
         getClientConfigs(previousWeekStartStr),
         getConsultantConfigs(previousWeekStartStr),
         getEditableTaskBillableRollups(weekStartStr),
+        getEditableTaskBillableRollups(previousWeekStartStr),
         getTaskSidebarStructure(),
     ]);
 
     const isError = !Array.isArray(initialTasks) && (initialTasks as any).error;
     const validTasks = isError ? [] : initialTasks;
-    const consultantNameById = new Map<number, string>();
+    const consultantRosterById = new Map<number, { id: number; name: string; firstName?: string; lastName?: string; email?: string; source?: string }>();
+    const consultantIdByNameKey = new Map<string, number>();
+
+    savedConsultants.forEach((consultant) => {
+        if (String(consultant.source ?? "") === "clickup") {
+            return;
+        }
+        const consultantName = consultant.fullName;
+        consultantRosterById.set(consultant.id, {
+            id: consultant.id,
+            name: consultantName,
+            firstName: consultant.firstName,
+            lastName: consultant.lastName,
+            email: consultant.email,
+            source: consultant.source,
+        });
+        const nameKey = normalizeConsultantNameKey(consultantName);
+        if (nameKey) consultantIdByNameKey.set(nameKey, consultant.id);
+    });
+
     validTasks
         .filter((task: any) => task.space?.id === PROFESSIONAL_SERVICES_SPACE_ID)
         .forEach((task: any) => {
@@ -119,23 +153,33 @@ export default async function DashboardPage({ searchParams }: { searchParams: { 
                 const id = Number(a?.id ?? 0);
                 const nextName = String(a?.username ?? "").trim();
                 if (!id || !nextName) return;
-                const existing = consultantNameById.get(id);
+                const existingById = consultantRosterById.get(id);
+                const nameKey = normalizeConsultantNameKey(nextName);
+                const matchedConsultantId = existingById ? id : consultantIdByNameKey.get(nameKey);
+                const existing = matchedConsultantId ? consultantRosterById.get(matchedConsultantId) : undefined;
                 if (!existing) {
-                    consultantNameById.set(id, nextName);
+                    consultantRosterById.set(id, { id, name: nextName, source: "clickup" });
+                    if (nameKey) consultantIdByNameKey.set(nameKey, id);
                     return;
                 }
-                const existingTokens = existing.split(/\s+/).filter(Boolean).length;
+                const existingTokens = existing.name.split(/\s+/).filter(Boolean).length;
                 const nextTokens = nextName.split(/\s+/).filter(Boolean).length;
-                if (nextTokens > existingTokens || (nextTokens === existingTokens && nextName.length > existing.length)) {
-                    consultantNameById.set(id, nextName);
+                if (nextTokens > existingTokens || (nextTokens === existingTokens && nextName.length > existing.name.length)) {
+                    consultantRosterById.set(existing.id, {
+                        ...existing,
+                        name: nextName,
+                    });
+                    if (nameKey) consultantIdByNameKey.set(nameKey, existing.id);
                 }
             });
         });
 
-    const consultantRoster = Array.from(consultantNameById.entries())
-        .map(([id, name]) => ({ id, name }))
+    const consultantRoster = Array.from(consultantRosterById.values())
         .sort((a, b) => a.name.localeCompare(b.name));
-    const capacityGridConfig = await getCapacityGridConfig(weekStartStr, consultantRoster);
+    const capacityGridConfig = await getCapacityGridConfig(
+        weekStartStr,
+        consultantRoster.map(({ id, name }) => ({ id, name }))
+    );
     const validYearTimeEntries = Array.isArray(yearTimeEntries) ? yearTimeEntries : [];
     const weekConfigByStart = new Map<string, { baseTarget: number, stretchTarget: number }>();
     weekConfigsForYear.forEach((cfg: any) => {
@@ -240,7 +284,33 @@ export default async function DashboardPage({ searchParams }: { searchParams: { 
     };
 
     const baseClientConfigs = await getClientConfigs(BASE_CONFIG_WEEK);
-    let finalClientConfigs = mergeClientConfigs(baseClientConfigs, clientConfigs);
+    const activeClientIds = new Set(
+        clientDirectory
+            .filter((client) => client.isActive)
+            .map((client) => String(client.id))
+    );
+    const clientDirectoryById = new Map(
+        clientDirectory.map((client) => [String(client.id), client] as const)
+    );
+
+    let finalClientConfigs = mergeClientConfigs(baseClientConfigs, clientConfigs)
+        .map((row) => {
+            const client = clientDirectoryById.get(String(row.clientId));
+            if (!client) return row;
+            return {
+                ...row,
+                clientName: client.name || row.clientName,
+                team: client.team ?? row.team,
+                sa: client.sa || row.sa,
+                dealType: client.dealType || row.dealType,
+                min: client.min ?? row.min,
+                max: client.max ?? row.max,
+                isActive: client.isActive,
+                isInternal: client.isInternal,
+                orderIndex: client.sortOrder ?? row.orderIndex ?? 0,
+            };
+        })
+        .filter((row) => activeClientIds.size === 0 || activeClientIds.has(String(row.clientId)));
 
     if (clientConfigs.length > 0 && clientConfigs.length < baseClientConfigs.length) {
         console.log(
@@ -275,6 +345,8 @@ export default async function DashboardPage({ searchParams }: { searchParams: { 
                 weeklyTrend,
                 leadConfigs,
                 clientConfigs: finalClientConfigs,
+                clientDirectory,
+                consultants: consultantRoster,
                 consultantConfigs: finalConsultantConfigs,
                 capacityGridConfig,
                 consultantConfigsForYear,
@@ -283,6 +355,7 @@ export default async function DashboardPage({ searchParams }: { searchParams: { 
                 previousLeadConfigs,
                 previousClientConfigs,
                 previousConsultantConfigs,
+                previousTaskBillableRollups,
             }}
         />
     );

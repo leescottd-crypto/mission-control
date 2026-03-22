@@ -1,18 +1,24 @@
 "use client";
 
 import { useEffect, useMemo, useState, useTransition } from "react";
+import { useRouter } from "next/navigation";
 import { addDays, addWeeks, format, startOfWeek, subWeeks } from "date-fns";
-import { ChevronLeft, ChevronRight, GripVertical, Plus, Save, Trash2, X } from "lucide-react";
+import { ChevronLeft, ChevronRight, GripVertical, Paperclip, Plus, Save, Trash2, Upload, X } from "lucide-react";
 import {
     addEditableTaskBillableEntry,
     createEditableTask,
     deleteEditableTaskBillableEntry,
+    deleteEditableTaskAttachment,
+    EditableTaskAttachmentRecord,
     EditableTaskBillableEntryRecord,
     deleteEditableTask,
     EditableTaskRecord,
     EditableTaskSeed,
     getEditableTasks,
+    removeTaskSidebarFolder,
+    removeTaskSidebarBoard,
     updateEditableTask,
+    updateEditableTaskBillableEntry,
 } from "@/app/actions";
 import { ClickUpTask } from "@/lib/clickup";
 import { cn } from "@/lib/utils";
@@ -23,9 +29,12 @@ interface EditableTaskBoardProps {
     scopeType: "all" | "list" | "folder";
     scopeId: string;
     scopeName: string;
+    scopeParentFolderId?: string | null;
     assigneeOptions?: string[];
     initialAssigneeFilter?: string | null;
     tabId?: string;
+    onNavigateWeek?: (nextWeek: string) => void;
+    onAssigneeFilterChange?: (assignee: string | null) => void;
 }
 
 type EditableStatus = "backlog" | "open" | "closed";
@@ -35,6 +44,7 @@ type EditableTaskFormState = {
     subject: string;
     description: string;
     assignee: string;
+    isAi: boolean;
     week: string;
     status: EditableStatus;
 };
@@ -45,6 +55,7 @@ type BillableEntryDraft = {
     entryDate: string;
     hours: number;
     note: string;
+    isValueAdd: boolean;
 };
 
 const STATUS_COLUMNS: Array<{ id: EditableStatus; label: string }> = [
@@ -211,16 +222,26 @@ function getTaskClientDisplayLabel(
     return taskClientLabelBySourceTaskId.get(String(task.sourceTaskId)) ?? scopeName;
 }
 
+function formatAttachmentSize(sizeBytes: number) {
+    if (sizeBytes < 1024) return `${sizeBytes} B`;
+    if (sizeBytes < 1024 * 1024) return `${(sizeBytes / 1024).toFixed(1)} KB`;
+    return `${(sizeBytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 export function EditableTaskBoard({
     activeWeekStr,
     tasks,
     scopeType,
     scopeId,
     scopeName,
+    scopeParentFolderId = null,
     assigneeOptions = [],
     initialAssigneeFilter = null,
     tabId = "issues",
+    onNavigateWeek,
+    onAssigneeFilterChange,
 }: EditableTaskBoardProps) {
+    const router = useRouter();
     const [boardTasks, setBoardTasks] = useState<EditableTaskRecord[]>([]);
     const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
     const [editorState, setEditorState] = useState<EditableTaskFormState | null>(null);
@@ -231,10 +252,15 @@ export function EditableTaskBoard({
         entryDate: getDefaultBillableEntryDate(activeWeekStr),
         hours: 0,
         note: "",
+        isValueAdd: false,
     });
     const [dragTaskId, setDragTaskId] = useState<string | null>(null);
     const [isPending, startTransition] = useTransition();
     const [isLoading, setIsLoading] = useState(false);
+    const [isUploadingAttachment, setIsUploadingAttachment] = useState(false);
+    const [attachmentMessage, setAttachmentMessage] = useState<string | null>(null);
+    const [boardDeleteOpen, setBoardDeleteOpen] = useState(false);
+    const [folderDeleteOpen, setFolderDeleteOpen] = useState(false);
 
     const activeWeekDate = useMemo(() => new Date(`${activeWeekStr}T00:00:00`), [activeWeekStr]);
     const weekRangeLabel = `${format(activeWeekDate, "MMM d")} to ${format(addDays(activeWeekDate, 4), "MMM d")}`;
@@ -286,6 +312,7 @@ export function EditableTaskBoard({
             subject: task.subject,
             description: task.description,
             assignee: task.assignee,
+            isAi: Boolean(task.isAi ?? false),
             week: task.week,
             status: task.status,
         });
@@ -294,6 +321,7 @@ export function EditableTaskBoard({
             entryDate: getDefaultBillableEntryDate(activeWeekStr),
             hours: 0,
             note: "",
+            isValueAdd: false,
         });
     }, [selectedTaskId, boardTasks, activeWeekStr]);
 
@@ -351,6 +379,7 @@ export function EditableTaskBoard({
             subject: "New Task",
             description: "",
             assignee: "",
+            isAi: false,
             billableHoursToday: 0,
             status: "backlog",
         });
@@ -382,18 +411,22 @@ export function EditableTaskBoard({
     const handleSaveEditor = () => {
         if (!editorState) return;
         const normalizedWeek = toWeekStart(editorState.week);
+        const savedTaskId = editorState.id;
         persistTaskUpdate(editorState.id, {
             subject: editorState.subject.trim() || "Untitled Task",
             description: editorState.description,
             assignee: editorState.assignee,
+            isAi: editorState.isAi,
             week: normalizedWeek,
             status: editorState.status,
         });
         if (normalizedWeek !== activeWeekStr) {
             setBoardTasks((prev) => prev.filter((task) => task.id !== editorState.id));
-            setSelectedTaskId(null);
-            setIsCenteredEditorOpen(false);
         }
+        if (selectedTaskId === savedTaskId) {
+            setSelectedTaskId(null);
+        }
+        setIsCenteredEditorOpen(false);
     };
 
     const assigneePickList = useMemo(() => {
@@ -423,6 +456,10 @@ export function EditableTaskBoard({
         [boardTasks, selectedTaskId]
     );
 
+    useEffect(() => {
+        setAttachmentMessage(null);
+    }, [selectedTaskId]);
+
     const handleAddBillableEntry = async () => {
         if (!selectedTask || !billableEntryDraft.entryDate) return;
         const created = await addEditableTaskBillableEntry({
@@ -430,6 +467,7 @@ export function EditableTaskBoard({
             entryDate: billableEntryDraft.entryDate,
             hours: Number(billableEntryDraft.hours ?? 0),
             note: billableEntryDraft.note,
+            isValueAdd: billableEntryDraft.isValueAdd,
         });
         if (!created) return;
 
@@ -448,6 +486,7 @@ export function EditableTaskBoard({
             entryDate: getDefaultBillableEntryDate(activeWeekStr),
             hours: 0,
             note: "",
+            isValueAdd: false,
         });
     };
 
@@ -462,6 +501,77 @@ export function EditableTaskBoard({
         }));
     };
 
+    const handleToggleTaskAi = (task: EditableTaskRecord, nextValue: boolean) => {
+        persistTaskUpdate(task.id, { isAi: nextValue });
+        if (editorState?.id === task.id) {
+            setEditorState((prev) => prev ? { ...prev, isAi: nextValue } : prev);
+        }
+    };
+
+    const handleToggleBillableValueAdd = async (entry: EditableTaskBillableEntryRecord, nextValue: boolean) => {
+        setBoardTasks((prev) => prev.map((task) => {
+            if (task.id !== entry.taskId) return task;
+            return {
+                ...task,
+                billableEntries: (task.billableEntries || []).map((item) => (
+                    item.id === entry.id ? { ...item, isValueAdd: nextValue } : item
+                )),
+            };
+        }));
+
+        await updateEditableTaskBillableEntry(entry.id, { isValueAdd: nextValue });
+    };
+
+    const handleAttachmentUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+        const selectedFile = event.target.files?.[0];
+        if (!selectedTask || !selectedFile) return;
+
+        setIsUploadingAttachment(true);
+        setAttachmentMessage(null);
+
+        try {
+            const formData = new FormData();
+            formData.set("taskId", selectedTask.id);
+            formData.set("file", selectedFile);
+
+            const response = await fetch("/api/task-attachments", {
+                method: "POST",
+                body: formData,
+            });
+            const payload = await response.json().catch(() => null);
+
+            if (!response.ok) {
+                throw new Error(String(payload?.error || "Upload failed."));
+            }
+
+            const created = payload as EditableTaskAttachmentRecord;
+            setBoardTasks((prev) => prev.map((task) => {
+                if (task.id !== selectedTask.id) return task;
+                return {
+                    ...task,
+                    attachments: [created, ...(task.attachments || [])],
+                };
+            }));
+            setAttachmentMessage(`${selectedFile.name} uploaded.`);
+        } catch (error) {
+            setAttachmentMessage(error instanceof Error ? error.message : "Upload failed.");
+        } finally {
+            event.target.value = "";
+            setIsUploadingAttachment(false);
+        }
+    };
+
+    const handleDeleteAttachment = async (attachment: EditableTaskAttachmentRecord) => {
+        await deleteEditableTaskAttachment(attachment.id);
+        setBoardTasks((prev) => prev.map((task) => {
+            if (task.id !== attachment.taskId) return task;
+            return {
+                ...task,
+                attachments: (task.attachments || []).filter((item) => item.id !== attachment.id),
+            };
+        }));
+    };
+
     const handleReturnToCapacityGrid = () => {
         if (typeof window === "undefined") return;
         if (returnToHref) {
@@ -469,6 +579,33 @@ export function EditableTaskBoard({
             return;
         }
         window.history.back();
+    };
+
+    const handleDeleteBoard = () => {
+        if (scopeType !== "list") return;
+        startTransition(async () => {
+            await removeTaskSidebarBoard(scopeId);
+            const params = new URLSearchParams();
+            if (activeWeekStr) params.set("week", activeWeekStr);
+            params.set("tab", tabId);
+            if (initialAssigneeFilter) params.set("assignee", initialAssigneeFilter);
+            if (scopeParentFolderId) {
+                params.set("folderId", scopeParentFolderId);
+            }
+            window.location.href = `/?${params.toString()}`;
+        });
+    };
+
+    const handleDeleteFolder = () => {
+        if (scopeType !== "folder") return;
+        startTransition(async () => {
+            await removeTaskSidebarFolder(scopeId);
+            const params = new URLSearchParams();
+            if (activeWeekStr) params.set("week", activeWeekStr);
+            params.set("tab", tabId);
+            if (initialAssigneeFilter) params.set("assignee", initialAssigneeFilter);
+            window.location.href = `/?${params.toString()}`;
+        });
     };
 
     const renderTaskEditorFields = () => (
@@ -514,6 +651,19 @@ export function EditableTaskBoard({
                 </select>
             </label>
 
+            <label className="flex items-center gap-3 rounded-md border border-border bg-background/40 px-3 py-2">
+                <input
+                    type="checkbox"
+                    checked={Boolean(editorState?.isAi)}
+                    onChange={(event) => setEditorState((prev) => prev ? { ...prev, isAi: event.target.checked } : prev)}
+                    className="h-4 w-4 rounded border-border bg-background/60 text-primary focus:ring-primary"
+                />
+                <div>
+                    <div className="text-sm font-medium text-white">AI</div>
+                    <div className="text-[11px] text-text-muted">Mark this task as AI-related work.</div>
+                </div>
+            </label>
+
             <label className="block space-y-1">
                 <span className="text-[11px] uppercase tracking-wider text-text-muted">Week Of</span>
                 <input
@@ -538,6 +688,72 @@ export function EditableTaskBoard({
                     ))}
                 </select>
             </label>
+
+            <div className="space-y-3 rounded-xl border border-border/60 bg-surface/20 p-4">
+                <div className="flex items-center justify-between gap-3">
+                    <div>
+                        <div className="text-sm font-semibold text-white">Attachments</div>
+                        <div className="text-[11px] text-text-muted">
+                            Quick MVP upload for task files. Supports common document types up to 15MB.
+                        </div>
+                    </div>
+                    <label className="inline-flex cursor-pointer items-center gap-2 rounded-md border border-border/60 bg-background/60 px-3 py-2 text-xs font-medium text-text-main hover:bg-surface-hover">
+                        <Upload className="h-3.5 w-3.5" />
+                        {isUploadingAttachment ? "Uploading..." : "Add File"}
+                        <input
+                            type="file"
+                            onChange={handleAttachmentUpload}
+                            disabled={!selectedTask || isUploadingAttachment}
+                            className="hidden"
+                        />
+                    </label>
+                </div>
+
+                {attachmentMessage && (
+                    <div className="rounded-md border border-primary/20 bg-primary/5 px-3 py-2 text-xs text-text-muted">
+                        {attachmentMessage}
+                    </div>
+                )}
+
+                <div className="space-y-2">
+                    {(selectedTask?.attachments || []).length === 0 && (
+                        <div className="rounded-lg border border-dashed border-border/40 px-3 py-4 text-xs text-text-muted">
+                            No attachments yet.
+                        </div>
+                    )}
+                    {(selectedTask?.attachments || []).map((attachment) => (
+                        <div
+                            key={attachment.id}
+                            className="flex items-center justify-between gap-3 rounded-lg border border-border/50 bg-background/40 px-3 py-3"
+                        >
+                            <div className="min-w-0">
+                                <div className="flex items-center gap-2 text-sm font-medium text-white">
+                                    <Paperclip className="h-3.5 w-3.5 shrink-0 text-text-muted" />
+                                    <a
+                                        href={attachment.downloadUrl}
+                                        target="_blank"
+                                        rel="noreferrer"
+                                        className="truncate hover:text-primary"
+                                    >
+                                        {attachment.originalName}
+                                    </a>
+                                </div>
+                                <div className="mt-1 text-[11px] text-text-muted">
+                                    {formatAttachmentSize(attachment.sizeBytes)} · {attachment.mimeType}
+                                </div>
+                            </div>
+                            <button
+                                type="button"
+                                onClick={() => handleDeleteAttachment(attachment)}
+                                className="inline-flex items-center gap-1 rounded-md border border-red-500/30 px-2 py-1 text-xs text-red-200 hover:bg-red-500/10"
+                            >
+                                <Trash2 className="h-3.5 w-3.5" />
+                                Delete
+                            </button>
+                        </div>
+                    ))}
+                </div>
+            </div>
 
             <div className="flex items-center justify-between gap-2">
                 <button
@@ -572,7 +788,7 @@ export function EditableTaskBoard({
                     Logged billable hours here will roll up into Capacity Grid actuals for this consultant and client.
                 </div>
 
-                <div className="grid grid-cols-1 gap-3 md:grid-cols-[160px_120px_minmax(0,1fr)_auto]">
+                <div className="grid grid-cols-1 gap-3 md:grid-cols-[160px_120px_minmax(0,1fr)_160px_auto]">
                     <label className="block space-y-1">
                         <span className="text-[11px] uppercase tracking-wider text-text-muted">Date</span>
                         <input
@@ -603,6 +819,17 @@ export function EditableTaskBoard({
                             className="w-full rounded-md border border-border bg-background/60 px-3 py-2 text-sm text-white outline-none focus:border-primary"
                         />
                     </label>
+                    <label className="flex items-end">
+                        <span className="flex w-full items-center gap-3 rounded-md border border-border bg-background/60 px-3 py-2 text-sm text-white">
+                            <input
+                                type="checkbox"
+                                checked={billableEntryDraft.isValueAdd}
+                                onChange={(event) => setBillableEntryDraft((prev) => ({ ...prev, isValueAdd: event.target.checked }))}
+                                className="h-4 w-4 rounded border-border bg-background/60 text-primary focus:ring-primary"
+                            />
+                            <span>Value Add</span>
+                        </span>
+                    </label>
                     <div className="flex items-end">
                         <button
                             type="button"
@@ -632,6 +859,15 @@ export function EditableTaskBoard({
                                     <div className="text-sm font-medium text-white">
                                         {entry.hours.toFixed(2)}h on {format(new Date(`${entry.entryDate}T00:00:00`), "MMM d, yyyy")}
                                     </div>
+                                    <label className="mt-2 inline-flex items-center gap-2 text-xs text-text-muted">
+                                        <input
+                                            type="checkbox"
+                                            checked={Boolean(entry.isValueAdd)}
+                                            onChange={(event) => handleToggleBillableValueAdd(entry, event.target.checked)}
+                                            className="h-3.5 w-3.5 rounded border-border bg-background/60 text-primary focus:ring-primary"
+                                        />
+                                        <span>Value Add</span>
+                                    </label>
                                     <div className="mt-1 text-xs text-text-muted">
                                         {entry.note || "No note"}
                                     </div>
@@ -672,7 +908,14 @@ export function EditableTaskBoard({
                     )}
                     <div className="flex items-center rounded-md border border-border/70 overflow-hidden bg-surface/20">
                         <button
-                            onClick={() => { window.location.href = buildWeekNavigationHref(format(subWeeks(activeWeekDate, 1), "yyyy-MM-dd"), tabId); }}
+                            onClick={() => {
+                                const nextWeek = format(subWeeks(activeWeekDate, 1), "yyyy-MM-dd");
+                                if (onNavigateWeek) {
+                                    onNavigateWeek(nextWeek);
+                                } else {
+                                    router.push(buildWeekNavigationHref(nextWeek, tabId), { scroll: false });
+                                }
+                            }}
                             className="h-9 w-9 flex items-center justify-center text-text-muted hover:text-white hover:bg-surface-hover transition-colors border-r border-border/70"
                             aria-label="Previous week"
                         >
@@ -683,7 +926,14 @@ export function EditableTaskBoard({
                             <div className="text-xs font-semibold text-white">{weekRangeLabel}</div>
                         </div>
                         <button
-                            onClick={() => { window.location.href = buildWeekNavigationHref(format(addWeeks(activeWeekDate, 1), "yyyy-MM-dd"), tabId); }}
+                            onClick={() => {
+                                const nextWeek = format(addWeeks(activeWeekDate, 1), "yyyy-MM-dd");
+                                if (onNavigateWeek) {
+                                    onNavigateWeek(nextWeek);
+                                } else {
+                                    router.push(buildWeekNavigationHref(nextWeek, tabId), { scroll: false });
+                                }
+                            }}
                             className="h-9 w-9 flex items-center justify-center text-text-muted hover:text-white hover:bg-surface-hover transition-colors border-l border-border/70"
                             aria-label="Next week"
                         >
@@ -693,11 +943,38 @@ export function EditableTaskBoard({
                     <span className="text-xs text-text-muted">Scope: {scopeName}</span>
                 </div>
                 <div className="flex items-center gap-3">
+                    {scopeType === "folder" && (
+                        <button
+                            type="button"
+                            onClick={() => setFolderDeleteOpen(true)}
+                            className="inline-flex items-center gap-2 rounded-md border border-red-500/35 bg-red-500/10 px-3 py-1.5 text-xs text-red-200 hover:bg-red-500/20"
+                        >
+                            <Trash2 className="w-3.5 h-3.5" />
+                            Delete Team
+                        </button>
+                    )}
+                    {scopeType === "list" && (
+                        <button
+                            type="button"
+                            onClick={() => setBoardDeleteOpen(true)}
+                            className="inline-flex items-center gap-2 rounded-md border border-red-500/35 bg-red-500/10 px-3 py-1.5 text-xs text-red-200 hover:bg-red-500/20"
+                        >
+                            <Trash2 className="w-3.5 h-3.5" />
+                            Delete Board
+                        </button>
+                    )}
                     <label className="flex items-center gap-2 text-xs text-text-muted">
                         <span>Assignee</span>
                         <select
                             value={initialAssigneeFilter ?? ""}
-                            onChange={(event) => { window.location.href = buildAssigneeFilterHref(event.target.value || null, tabId); }}
+                            onChange={(event) => {
+                                const nextAssignee = event.target.value || null;
+                                if (onAssigneeFilterChange) {
+                                    onAssigneeFilterChange(nextAssignee);
+                                } else {
+                                    router.push(buildAssigneeFilterHref(nextAssignee, tabId), { scroll: false });
+                                }
+                            }}
                             className="rounded-md border border-border bg-surface/30 px-2 py-1.5 text-xs text-white outline-none focus:border-primary"
                         >
                             <option value="">All Active Consultants</option>
@@ -783,6 +1060,18 @@ export function EditableTaskBoard({
                                                     </div>
                                                     <GripVertical className="w-4 h-4 text-text-muted shrink-0" />
                                                 </div>
+                                                <label
+                                                    className="mt-3 inline-flex items-center gap-2 text-xs text-text-muted"
+                                                    onClick={(event) => event.stopPropagation()}
+                                                >
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={Boolean(task.isAi)}
+                                                        onChange={(event) => handleToggleTaskAi(task, event.target.checked)}
+                                                        className="h-3.5 w-3.5 rounded border-border bg-background/60 text-primary focus:ring-primary"
+                                                    />
+                                                    <span>AI</span>
+                                                </label>
                                                 <div className="mt-3 flex items-center justify-between gap-2 text-[11px] text-text-muted">
                                                     <span className="truncate">{task.assignee || "Unassigned"}</span>
                                                     <div className="flex items-center gap-3">
@@ -898,6 +1187,72 @@ export function EditableTaskBoard({
                                 </button>
                             </div>
                             {editorTab === "details" ? renderTaskEditorFields() : renderBillableHistoryTab()}
+                        </div>
+                    </div>
+                </div>
+            )}
+            {boardDeleteOpen && scopeType === "list" && (
+                <div className="fixed inset-0 z-[86] flex items-center justify-center bg-black/55 backdrop-blur-sm p-4">
+                    <div className="w-full max-w-md overflow-hidden rounded-2xl border border-border/60 bg-[#111318] shadow-[0_24px_80px_rgba(0,0,0,0.45)]">
+                        <div className="border-b border-border/50 bg-surface/80 px-5 py-4">
+                            <div className="text-sm font-semibold text-text-main">Delete Board</div>
+                            <div className="mt-1 text-xs text-text-muted">
+                                This will remove <span className="font-medium text-white">{scopeName}</span> from this screen.
+                            </div>
+                        </div>
+                        <div className="px-5 py-4 text-sm text-text-muted">
+                            Any editable tasks and billable history saved inside this board will also be removed from Mission Control.
+                        </div>
+                        <div className="flex items-center justify-end gap-2 border-t border-border/50 bg-surface/50 px-5 py-4">
+                            <button
+                                type="button"
+                                onClick={() => setBoardDeleteOpen(false)}
+                                className="inline-flex items-center gap-2 rounded-md border border-border/60 px-3 py-2 text-sm text-text-main hover:bg-surface-hover"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                type="button"
+                                onClick={handleDeleteBoard}
+                                disabled={isPending}
+                                className="inline-flex items-center gap-2 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-200 hover:bg-red-500/20 disabled:opacity-60"
+                            >
+                                <Trash2 className="w-4 h-4" />
+                                Delete Board
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+            {folderDeleteOpen && scopeType === "folder" && (
+                <div className="fixed inset-0 z-[86] flex items-center justify-center bg-black/55 backdrop-blur-sm p-4">
+                    <div className="w-full max-w-md overflow-hidden rounded-2xl border border-border/60 bg-[#111318] shadow-[0_24px_80px_rgba(0,0,0,0.45)]">
+                        <div className="border-b border-border/50 bg-surface/80 px-5 py-4">
+                            <div className="text-sm font-semibold text-text-main">Delete Team</div>
+                            <div className="mt-1 text-xs text-text-muted">
+                                This will remove <span className="font-medium text-white">{scopeName}</span> from this screen.
+                            </div>
+                        </div>
+                        <div className="px-5 py-4 text-sm text-text-muted">
+                            Boards inside this team will no longer appear in Mission Control until the folder is restored or recreated.
+                        </div>
+                        <div className="flex items-center justify-end gap-2 border-t border-border/50 bg-surface/50 px-5 py-4">
+                            <button
+                                type="button"
+                                onClick={() => setFolderDeleteOpen(false)}
+                                className="inline-flex items-center gap-2 rounded-md border border-border/60 px-3 py-2 text-sm text-text-main hover:bg-surface-hover"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                type="button"
+                                onClick={handleDeleteFolder}
+                                disabled={isPending}
+                                className="inline-flex items-center gap-2 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-200 hover:bg-red-500/20 disabled:opacity-60"
+                            >
+                                <Trash2 className="w-4 h-4" />
+                                Delete Team
+                            </button>
                         </div>
                     </div>
                 </div>

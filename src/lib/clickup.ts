@@ -45,6 +45,15 @@ export interface ClickUpFolderHierarchy {
     lists: ClickUpListHierarchy[];
 }
 
+export interface ClickUpTeamMember {
+    id: number;
+    username: string;
+    email: string;
+    firstName: string;
+    lastName: string;
+    color?: string;
+}
+
 export interface TimeEntry {
     id: string;
     task: { id: string; name: string };
@@ -52,6 +61,53 @@ export interface TimeEntry {
     duration: number; // in milliseconds
     start: string;
     end: string;
+}
+
+function splitName(name: string) {
+    const trimmed = String(name || "").trim();
+    if (!trimmed) {
+        return { firstName: "", lastName: "" };
+    }
+    const parts = trimmed.split(/\s+/).filter(Boolean);
+    return {
+        firstName: parts[0] ?? "",
+        lastName: parts.slice(1).join(" "),
+    };
+}
+
+function parseTeamMembers(payload: any): ClickUpTeamMember[] {
+    const candidateArrays = [
+        Array.isArray(payload?.members) ? payload.members : [],
+        Array.isArray(payload?.team?.members) ? payload.team.members : [],
+        ...(Array.isArray(payload?.teams)
+            ? payload.teams.map((team: any) => (Array.isArray(team?.members) ? team.members : []))
+            : []),
+    ];
+
+    const byId = new Map<number, ClickUpTeamMember>();
+
+    candidateArrays.flat().forEach((member: any) => {
+        const user = member?.user ?? member;
+        const id = Number(user?.id ?? member?.id ?? 0);
+        if (!Number.isFinite(id) || id <= 0) return;
+
+        const username = String(user?.username ?? member?.username ?? user?.name ?? member?.name ?? "").trim();
+        const email = String(user?.email ?? member?.email ?? "").trim().toLowerCase();
+        const firstName = String(user?.first_name ?? member?.first_name ?? user?.firstName ?? member?.firstName ?? "").trim();
+        const lastName = String(user?.last_name ?? member?.last_name ?? user?.lastName ?? member?.lastName ?? "").trim();
+        const fallbackName = splitName(username);
+
+        byId.set(id, {
+            id,
+            username,
+            email,
+            firstName: firstName || fallbackName.firstName,
+            lastName: lastName || fallbackName.lastName,
+            color: String(user?.color ?? member?.color ?? "").trim() || undefined,
+        });
+    });
+
+    return Array.from(byId.values()).sort((a, b) => a.username.localeCompare(b.username));
 }
 
 // Ensure the API token exists before making calls
@@ -177,6 +233,24 @@ export async function getTeamTimeEntries(startDateMs: number, endDateMs: number)
 
     // ClickUp returns time entries in a `data` array
     return (res.data as TimeEntry[]) || [];
+}
+
+export async function getTeamMembers(): Promise<ClickUpTeamMember[]> {
+    if (!TEAM_ID) return [];
+
+    const directTeam = await fetchWithAuth(`/team/${TEAM_ID}`);
+    const directMembers = parseTeamMembers(directTeam);
+    if (directMembers.length > 0) {
+        return directMembers;
+    }
+
+    const allTeams = await fetchWithAuth("/team");
+    const nestedMembers = parseTeamMembers(allTeams);
+    if (nestedMembers.length > 0) {
+        return nestedMembers;
+    }
+
+    return [];
 }
 
 // Calculate high level metrics

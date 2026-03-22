@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo, useEffect, useCallback } from "react";
+import { useState, useMemo, useEffect, useCallback, useRef } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Sidebar, FolderWithLists } from "@/components/Sidebar";
 import { EditableTaskBoard } from "@/components/EditableTaskBoard";
@@ -8,9 +8,11 @@ import { CommandCenter } from "@/components/CommandCenter";
 import { ProjectsBacklogGrowth } from "@/components/ProjectsBacklogGrowth";
 import { CapacityGrid } from "@/components/CapacityGrid";
 import { ConsultantUtilization } from "@/components/ConsultantUtilization";
+import { Timesheets } from "@/components/Timesheets";
+import { ClientSetup } from "@/components/ClientSetup";
 import { Trends } from "@/components/Trends";
 import { CapacityTrends } from "@/components/CapacityTrends";
-import { CapacityGridPayload, EditableTaskBillableRollupRecord, TaskSidebarStructureRecord } from "@/app/actions";
+import { CapacityGridPayload, EditableTaskBillableRollupRecord, TaskSidebarStructureRecord, loadDashboardWeekData } from "@/app/actions";
 import { ClickUpTask, TimeEntry, PROFESSIONAL_SERVICES_SPACE_ID } from "@/lib/clickup";
 import { Rocket } from "lucide-react";
 
@@ -29,9 +31,24 @@ interface DashboardClientProps {
     initialSidebarStructure?: TaskSidebarStructureRecord;
 }
 
+type ConsultantDirectoryEntry = {
+    id: number;
+    name: string;
+    firstName?: string;
+    lastName?: string;
+    email?: string;
+    source?: string;
+};
+
+type ClientOption = {
+    id: string;
+    name: string;
+};
+
 const EMPTY_CAPACITY_GRID: CapacityGridPayload = { resources: [], rows: [] };
-const VALID_TABS = new Set(["issues", "editable-tasks", "command-center", "trends", "capacity-trends", "consultant-utilization", "capacity-grid", "backlog-growth"]);
+const VALID_TABS = new Set(["issues", "editable-tasks", "command-center", "trends", "capacity-trends", "consultant-utilization", "timesheets", "capacity-grid", "client-setup", "backlog-growth"]);
 const normalizeTab = (tab?: string) => (tab && VALID_TABS.has(tab) ? tab : "command-center");
+type DashboardWeekSnapshot = Awaited<ReturnType<typeof loadDashboardWeekData>>;
 
 function pickPreferredConsultantName(currentName: string, incomingName: string) {
     const current = String(currentName || "").trim();
@@ -43,6 +60,10 @@ function pickPreferredConsultantName(currentName: string, incomingName: string) 
     if (incomingTokens > currentTokens) return incoming;
     if (incomingTokens === currentTokens && incoming.length > current.length) return incoming;
     return current;
+}
+
+function normalizeConsultantNameKey(value: string) {
+    return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
 }
 
 export function DashboardClient({
@@ -57,30 +78,54 @@ export function DashboardClient({
     initialSelectedFolderId = null,
     initialAssigneeFilter = null,
     initialTaskBillableRollups = [],
-    initialSidebarStructure = { folders: [], boards: [], hiddenBoardIds: [] },
+    initialSidebarStructure = { folders: [], boards: [], placements: [], folderOverrides: [], hiddenFolderIds: [], hiddenBoardIds: [] },
 }: DashboardClientProps) {
     const router = useRouter();
     const pathname = usePathname();
     const searchParams = useSearchParams();
-    const selectedListId = initialSelectedListId;
-    const selectedFolderId = initialSelectedFolderId;
-    const selectedAssigneeFilter = initialAssigneeFilter;
-    const activeTab = normalizeTab(initialTab);
+    const [isWeekLoading, setIsWeekLoading] = useState(false);
+    const [activeWeekStrState, setActiveWeekStrState] = useState(weekStartStr);
+    const [activeTabState, setActiveTabState] = useState(normalizeTab(initialTab));
+    const [selectedListIdState, setSelectedListIdState] = useState<string | null>(initialSelectedListId);
+    const [selectedFolderIdState, setSelectedFolderIdState] = useState<string | null>(initialSelectedFolderId);
+    const [selectedAssigneeFilterState, setSelectedAssigneeFilterState] = useState<string | null>(initialAssigneeFilter);
+    const [dashboardConfigState, setDashboardConfigState] = useState(dbConfig);
+    const [taskBillableRollupsState, setTaskBillableRollupsState] = useState<EditableTaskBillableRollupRecord[]>(initialTaskBillableRollups);
     const [capacityGridState, setCapacityGridState] = useState<CapacityGridPayload>(dbConfig?.capacityGridConfig ?? EMPTY_CAPACITY_GRID);
-    const resolvedActiveTab = normalizeTab(activeTab);
+    const weekRequestIdRef = useRef(0);
+    const weekSnapshotCacheRef = useRef<Map<string, DashboardWeekSnapshot>>(new Map());
+    const weekPrefetchInFlightRef = useRef<Set<string>>(new Set());
+    const resolvedActiveTab = normalizeTab(activeTabState);
 
     useEffect(() => {
+        setIsWeekLoading(false);
+        setActiveWeekStrState(weekStartStr);
+        setActiveTabState(normalizeTab(initialTab));
+        setSelectedListIdState(initialSelectedListId);
+        setSelectedFolderIdState(initialSelectedFolderId);
+        setSelectedAssigneeFilterState(initialAssigneeFilter);
+        setDashboardConfigState(dbConfig);
+        setTaskBillableRollupsState(initialTaskBillableRollups);
         setCapacityGridState(dbConfig?.capacityGridConfig ?? EMPTY_CAPACITY_GRID);
-    }, [weekStartStr, dbConfig?.capacityGridConfig]);
+    }, [
+        dbConfig,
+        initialAssigneeFilter,
+        initialSelectedFolderId,
+        initialSelectedListId,
+        initialTab,
+        initialTaskBillableRollups,
+        weekStartStr,
+    ]);
 
-    const navigateWithState = useCallback((
+    const buildDashboardHref = useCallback((
+        nextWeek: string,
         nextTab: string,
         nextListId: string | null,
         nextFolderId: string | null,
-        nextAssignee: string | null = selectedAssigneeFilter
+        nextAssignee: string | null = selectedAssigneeFilterState
     ) => {
         const params = new URLSearchParams(searchParams.toString());
-        params.set("week", weekStartStr);
+        params.set("week", nextWeek);
         params.set("tab", normalizeTab(nextTab));
         if (nextAssignee) {
             params.set("assignee", nextAssignee);
@@ -97,53 +142,201 @@ export function DashboardClient({
             params.delete("listId");
             params.delete("folderId");
         }
-        router.push(`${pathname}?${params.toString()}`, { scroll: false });
-    }, [pathname, router, searchParams, selectedAssigneeFilter, weekStartStr]);
+        return `${pathname}?${params.toString()}`;
+    }, [pathname, searchParams, selectedAssigneeFilterState]);
+
+    const syncBrowserUrl = useCallback((href: string) => {
+        if (typeof window === "undefined") return;
+        window.history.pushState({}, "", href);
+    }, []);
+
+    const navigateWithState = useCallback((
+        nextTab: string,
+        nextListId: string | null,
+        nextFolderId: string | null,
+        nextAssignee: string | null = selectedAssigneeFilterState
+    ) => {
+        const normalizedTab = normalizeTab(nextTab);
+        setActiveTabState(normalizedTab);
+        setSelectedListIdState(nextListId);
+        setSelectedFolderIdState(nextFolderId);
+        setSelectedAssigneeFilterState(nextAssignee);
+        syncBrowserUrl(buildDashboardHref(activeWeekStrState, normalizedTab, nextListId, nextFolderId, nextAssignee));
+    }, [activeWeekStrState, buildDashboardHref, selectedAssigneeFilterState, syncBrowserUrl]);
 
     // Filter tasks down strictly to the Professional Services space
     const proServicesTasks = useMemo(() => {
         return initialTasks.filter(t => t.space?.id === PROFESSIONAL_SERVICES_SPACE_ID);
     }, [initialTasks]);
 
+    const clientOptions = useMemo<ClientOption[]>(() => {
+        const rows = Array.isArray(dashboardConfigState?.clientDirectory) ? dashboardConfigState.clientDirectory : [];
+        const byId = new Map<string, ClientOption>();
+        rows.forEach((row: any) => {
+            if (row?.isActive === false) return;
+            const id = String(row?.id ?? "").trim();
+            const name = String(row?.name ?? row?.id ?? "").trim();
+            if (!id || !name) return;
+            byId.set(id, { id, name });
+        });
+        return Array.from(byId.values()).sort((a, b) => a.name.localeCompare(b.name));
+    }, [dashboardConfigState?.clientDirectory]);
+
     const availableFolders = useMemo(() => {
         const shouldExcludeList = (name: string) => /user\s*guide/i.test(name);
+        const hiddenFolderIds = new Set((initialSidebarStructure?.hiddenFolderIds ?? []).map((id) => String(id)));
         const hiddenBoardIds = new Set((initialSidebarStructure?.hiddenBoardIds ?? []).map((id) => String(id)));
-        const localBoardsByFolderId = new Map<string, Array<{ id: string; name: string; source: "local" }>>();
-        (initialSidebarStructure?.boards ?? []).forEach((board) => {
-            if (hiddenBoardIds.has(String(board.id))) return;
-            const parentFolderId = String(board.parentFolderId ?? "");
-            const current = localBoardsByFolderId.get(parentFolderId) ?? [];
-            current.push({
-                id: String(board.id),
-                name: String(board.name),
+        const folderOverrideMap = new Map(
+            (initialSidebarStructure?.folderOverrides ?? []).map((override) => [
+                `${override.source}:${override.folderId}`,
+                override,
+            ])
+        );
+        const placementMap = new Map(
+            (initialSidebarStructure?.placements ?? []).map((placement) => [
+                `${placement.source}:${placement.boardId}`,
+                placement,
+            ])
+        );
+        const normalizedClientCandidates = clientOptions.map((client) => ({
+            ...client,
+            normalizedId: normalizeConsultantNameKey(client.id),
+            normalizedName: normalizeConsultantNameKey(client.name),
+        }));
+
+        const inferClientFromBoardName = (boardName: string): ClientOption | null => {
+            const normalizedBoardName = normalizeConsultantNameKey(boardName);
+            if (!normalizedBoardName) return null;
+            let bestMatch: { id: string; name: string; score: number } | null = null;
+            for (const client of normalizedClientCandidates) {
+                const idScore = client.normalizedId && normalizedBoardName.includes(client.normalizedId) ? client.normalizedId.length + 100 : 0;
+                const nameScore = client.normalizedName && normalizedBoardName.includes(client.normalizedName) ? client.normalizedName.length : 0;
+                const score = Math.max(idScore, nameScore);
+                if (score <= 0) continue;
+                if (!bestMatch || score > bestMatch.score) {
+                    bestMatch = { id: client.id, name: client.name, score };
+                }
+            }
+            return bestMatch ? { id: bestMatch.id, name: bestMatch.name } : null;
+        };
+
+        const folderCatalog = new Map<string, { id: string; name: string; source: "clickup" | "local" }>();
+        initialFolders.forEach((folder) => {
+            if (hiddenFolderIds.has(String(folder.id))) return;
+            const override = folderOverrideMap.get(`clickup:${String(folder.id)}`);
+            folderCatalog.set(String(folder.id), {
+                id: String(folder.id),
+                name: String(override?.name ?? folder.name),
+                source: "clickup",
+            });
+        });
+        (initialSidebarStructure?.folders ?? []).forEach((folder) => {
+            if (hiddenFolderIds.has(String(folder.id))) return;
+            const override = folderOverrideMap.get(`local:${String(folder.id)}`);
+            folderCatalog.set(String(folder.id), {
+                id: String(folder.id),
+                name: String(override?.name ?? folder.name),
                 source: "local",
             });
-            localBoardsByFolderId.set(parentFolderId, current);
         });
+
+        const boardBuckets = new Map<
+            string,
+            Array<{
+                id: string;
+                name: string;
+                source: "clickup" | "local";
+                statusOrder?: string[];
+                clientId?: string | null;
+                clientName?: string | null;
+                sortOrder: number;
+            }>
+        >();
+
+        const pushBoard = (board: {
+            id: string;
+            name: string;
+            source: "clickup" | "local";
+            defaultFolderId: string;
+            defaultOrder: number;
+            statusOrder?: string[];
+        }) => {
+            const placement = placementMap.get(`${board.source}:${board.id}`);
+            const resolvedBoardName = String(placement?.boardName ?? board.name);
+            const linkedClient = placement?.clientId && placement?.clientName
+                ? { id: String(placement.clientId), name: String(placement.clientName) }
+                : inferClientFromBoardName(resolvedBoardName);
+            const targetFolderId = String(placement?.parentFolderId ?? board.defaultFolderId);
+            if (!targetFolderId) return;
+            const bucket = boardBuckets.get(targetFolderId) ?? [];
+            bucket.push({
+                id: board.id,
+                name: resolvedBoardName,
+                source: board.source,
+                statusOrder: board.statusOrder,
+                clientId: linkedClient?.id ?? null,
+                clientName: linkedClient?.name ?? null,
+                sortOrder: Number(placement?.orderIndex ?? board.defaultOrder),
+            });
+            boardBuckets.set(targetFolderId, bucket);
+        };
+
+        initialFolders.forEach((folder) => {
+            if (hiddenFolderIds.has(String(folder.id))) return;
+            folder.lists
+                .filter((list) => !shouldExcludeList(list.name) && !hiddenBoardIds.has(String(list.id)))
+                .forEach((list, index) => {
+                    pushBoard({
+                        id: String(list.id),
+                        name: String(list.name),
+                        source: "clickup",
+                        defaultFolderId: String(folder.id),
+                        defaultOrder: index,
+                        statusOrder: list.statusOrder,
+                    });
+                });
+        });
+
+        (initialSidebarStructure?.boards ?? [])
+            .filter((board) => !hiddenBoardIds.has(String(board.id)))
+            .forEach((board) => {
+                if (hiddenFolderIds.has(String(board.parentFolderId ?? ""))) return;
+                pushBoard({
+                    id: String(board.id),
+                    name: String(board.name),
+                    source: "local",
+                    defaultFolderId: String(board.parentFolderId ?? ""),
+                    defaultOrder: 1000 + Number(board.orderIndex ?? 0),
+                });
+            });
+
+        const buildFolder = (folderId: string): FolderWithLists | null => {
+            const folder = folderCatalog.get(folderId);
+            if (!folder) return null;
+            const lists = (boardBuckets.get(folderId) ?? [])
+                .sort((a, b) => {
+                    if (a.sortOrder !== b.sortOrder) return a.sortOrder - b.sortOrder;
+                    return a.name.localeCompare(b.name);
+                })
+                .map(({ sortOrder, ...list }) => list);
+            if (lists.length === 0) return null;
+            return {
+                id: folder.id,
+                name: folder.name,
+                source: folder.source,
+                lists,
+            };
+        };
 
         if (initialFolders.length > 0) {
             const clickupFolders = initialFolders
-                .map((folder) => ({
-                    ...folder,
-                    source: "clickup" as const,
-                    lists: [
-                        ...folder.lists
-                            .filter((list) => !shouldExcludeList(list.name) && !hiddenBoardIds.has(String(list.id)))
-                            .map((list) => ({
-                            ...list,
-                            source: "clickup" as const,
-                        })),
-                        ...(localBoardsByFolderId.get(folder.id) ?? []),
-                    ],
-                }))
-                .filter((folder) => folder.lists.length > 0);
-
-            const localFolders = (initialSidebarStructure?.folders ?? []).map((folder) => ({
-                id: String(folder.id),
-                name: String(folder.name),
-                source: "local" as const,
-                lists: localBoardsByFolderId.get(String(folder.id)) ?? [],
-            }));
+                .filter((folder) => !hiddenFolderIds.has(String(folder.id)))
+                .map((folder) => buildFolder(String(folder.id)))
+                .filter((folder): folder is FolderWithLists => folder !== null);
+            const localFolders = (initialSidebarStructure?.folders ?? [])
+                .filter((folder) => !hiddenFolderIds.has(String(folder.id)))
+                .map((folder) => buildFolder(String(folder.id)))
+                .filter((folder): folder is FolderWithLists => folder !== null);
 
             return [...clickupFolders, ...localFolders];
         }
@@ -151,6 +344,7 @@ export function DashboardClient({
         const folderMap = new Map<string, { id: string, name: string, source: "clickup", lists: Map<string, { id: string, name: string, statusOrder: string[], source: "clickup" }> }>();
         proServicesTasks.forEach((task) => {
             if (!task.folder?.id || !task.folder?.name) return;
+            if (hiddenFolderIds.has(String(task.folder.id))) return;
             if (!folderMap.has(task.folder.id)) {
                 folderMap.set(task.folder.id, {
                     id: task.folder.id,
@@ -159,36 +353,39 @@ export function DashboardClient({
                     lists: new Map()
                 });
             }
-
-                if (task.list?.id && task.list?.name) {
-                    if (shouldExcludeList(task.list.name) || hiddenBoardIds.has(String(task.list.id))) return;
-                    folderMap.get(task.folder.id)!.lists.set(task.list.id, {
-                        id: task.list.id,
-                        name: task.list.name,
+            if (task.list?.id && task.list?.name) {
+                if (shouldExcludeList(task.list.name) || hiddenBoardIds.has(String(task.list.id))) return;
+                folderMap.get(task.folder.id)!.lists.set(task.list.id, {
+                    id: task.list.id,
+                    name: task.list.name,
                     statusOrder: [],
                     source: "clickup",
                 });
             }
         });
 
-        const clickupFolders = Array.from(folderMap.values()).map((folder) => ({
-            id: folder.id,
-            name: folder.name,
-            source: folder.source,
-            lists: [
-                ...Array.from(folder.lists.values()),
-                ...(localBoardsByFolderId.get(folder.id) ?? []),
-            ]
-        }));
-        const localFolders = (initialSidebarStructure?.folders ?? []).map((folder) => ({
-            id: String(folder.id),
-            name: String(folder.name),
-            source: "local" as const,
-            lists: localBoardsByFolderId.get(String(folder.id)) ?? [],
-        }));
+        Array.from(folderMap.values()).forEach((folder) => {
+            Array.from(folder.lists.values()).forEach((list, index) => {
+                pushBoard({
+                    id: String(list.id),
+                    name: String(list.name),
+                    source: "clickup",
+                    defaultFolderId: String(folder.id),
+                    defaultOrder: index,
+                    statusOrder: list.statusOrder,
+                });
+            });
+        });
+
+        const clickupFolders = Array.from(folderMap.values())
+            .map((folder) => buildFolder(String(folder.id)))
+            .filter((folder): folder is FolderWithLists => folder !== null);
+        const localFolders = (initialSidebarStructure?.folders ?? [])
+            .map((folder) => buildFolder(String(folder.id)))
+            .filter((folder): folder is FolderWithLists => folder !== null);
 
         return [...clickupFolders, ...localFolders];
-    }, [initialFolders, initialSidebarStructure, proServicesTasks]);
+    }, [clientOptions, initialFolders, initialSidebarStructure, proServicesTasks]);
 
     const handleListSelect = (listId: string | null) => {
         const nextTab = "issues";
@@ -202,19 +399,27 @@ export function DashboardClient({
 
     const handleTabSelect = (tab: string) => {
         const nextTab = VALID_TABS.has(tab) ? tab : "command-center";
-        navigateWithState(nextTab, selectedListId, selectedFolderId);
+        navigateWithState(nextTab, selectedListIdState, selectedFolderIdState);
     };
+
+    const handleAssigneeFilterChange = useCallback((nextAssignee: string | null) => {
+        navigateWithState("issues", selectedListIdState, selectedFolderIdState, nextAssignee);
+    }, [navigateWithState, selectedFolderIdState, selectedListIdState]);
+
+    const handleTimesheetAssigneeFilterChange = useCallback((nextAssignee: string | null) => {
+        navigateWithState("timesheets", selectedListIdState, selectedFolderIdState, nextAssignee);
+    }, [navigateWithState, selectedFolderIdState, selectedListIdState]);
 
     // 3. Slice tasks based on active Client (List) or Team (Folder)
     const visibleTasks = useMemo(() => {
-        if (selectedListId) {
-            return proServicesTasks.filter(t => t.list?.id === selectedListId);
+        if (selectedListIdState) {
+            return proServicesTasks.filter(t => t.list?.id === selectedListIdState);
         }
-        if (selectedFolderId) {
-            return proServicesTasks.filter(t => t.folder?.id === selectedFolderId);
+        if (selectedFolderIdState) {
+            return proServicesTasks.filter(t => t.folder?.id === selectedFolderIdState);
         }
         return proServicesTasks;
-    }, [proServicesTasks, selectedListId, selectedFolderId]);
+    }, [proServicesTasks, selectedFolderIdState, selectedListIdState]);
 
     const projectOptions = useMemo(() => {
         return availableFolders
@@ -223,30 +428,30 @@ export function DashboardClient({
     }, [availableFolders]);
 
     const editableTaskScope = useMemo(() => {
-        if (selectedListId) {
+        if (selectedListIdState) {
             for (const folder of availableFolders) {
-                const list = folder.lists.find((item) => item.id === selectedListId);
+                const list = folder.lists.find((item) => item.id === selectedListIdState);
                 if (list) {
                     return {
                         type: "list",
-                        id: selectedListId,
+                        id: selectedListIdState,
                         name: list.name,
                     } as const;
                 }
             }
             return {
                 type: "list",
-                id: selectedListId,
-                name: selectedListId,
+                id: selectedListIdState,
+                name: selectedListIdState,
             } as const;
         }
 
-        if (selectedFolderId) {
-            const folder = availableFolders.find((item) => item.id === selectedFolderId);
+        if (selectedFolderIdState) {
+            const folder = availableFolders.find((item) => item.id === selectedFolderIdState);
             return {
                 type: "folder",
-                id: selectedFolderId,
-                name: folder?.name ?? selectedFolderId,
+                id: selectedFolderIdState,
+                name: folder?.name ?? selectedFolderIdState,
             } as const;
         }
 
@@ -255,7 +460,20 @@ export function DashboardClient({
             id: "all",
             name: "All Clients",
         } as const;
-    }, [availableFolders, selectedFolderId, selectedListId]);
+    }, [availableFolders, selectedFolderIdState, selectedListIdState]);
+
+    const selectedBoardMeta = useMemo(() => {
+        if (!selectedListIdState) return null;
+        for (const folder of availableFolders) {
+            const list = folder.lists.find((item) => item.id === selectedListIdState);
+            if (list) {
+                return {
+                    parentFolderId: String(folder.id),
+                };
+            }
+        }
+        return null;
+    }, [availableFolders, selectedListIdState]);
 
     const consultantsFromTasks = useMemo(() => {
         const byId = new Map<number, string>();
@@ -273,6 +491,53 @@ export function DashboardClient({
         return Array.from(byId.entries()).map(([id, name]) => ({ id, name }));
     }, [proServicesTasks]);
 
+    const consultantsFromDirectory = useMemo<ConsultantDirectoryEntry[]>(() => {
+        const rows = Array.isArray(dashboardConfigState?.consultants) ? dashboardConfigState.consultants : [];
+        return rows
+            .map((consultant: any): ConsultantDirectoryEntry => ({
+                id: Number(consultant?.id ?? 0),
+                name: String(consultant?.name ?? consultant?.fullName ?? "").trim(),
+                firstName: String(consultant?.firstName ?? "").trim(),
+                lastName: String(consultant?.lastName ?? "").trim(),
+                email: String(consultant?.email ?? "").trim(),
+                source: String(consultant?.source ?? "manual"),
+            }))
+            .filter((consultant: ConsultantDirectoryEntry) => Number.isFinite(consultant.id) && consultant.id !== 0 && consultant.name.length > 0);
+    }, [dashboardConfigState?.consultants]);
+
+    const consultantsFromManualDirectory = useMemo<ConsultantDirectoryEntry[]>(
+        () => consultantsFromDirectory.filter((consultant) => String(consultant.source ?? "") !== "clickup"),
+        [consultantsFromDirectory]
+    );
+
+    const mergedConsultants = useMemo<ConsultantDirectoryEntry[]>(() => {
+        const byId = new Map<number, ConsultantDirectoryEntry>();
+        const idByNameKey = new Map<string, number>();
+
+        consultantsFromManualDirectory.forEach((consultant: ConsultantDirectoryEntry) => {
+            byId.set(consultant.id, consultant);
+            const nameKey = normalizeConsultantNameKey(consultant.name);
+            if (nameKey) idByNameKey.set(nameKey, consultant.id);
+        });
+
+        consultantsFromTasks.forEach((consultant: { id: number; name: string }) => {
+            const nameKey = normalizeConsultantNameKey(consultant.name);
+            const existing = byId.get(consultant.id) || byId.get(idByNameKey.get(nameKey) || 0);
+            if (!existing) {
+                byId.set(consultant.id, consultant);
+                if (nameKey) idByNameKey.set(nameKey, consultant.id);
+                return;
+            }
+            byId.set(existing.id, {
+                ...existing,
+                name: pickPreferredConsultantName(existing.name, consultant.name),
+            });
+            if (nameKey) idByNameKey.set(nameKey, existing.id);
+        });
+
+        return Array.from(byId.values()).sort((a, b) => a.name.localeCompare(b.name));
+    }, [consultantsFromManualDirectory, consultantsFromTasks]);
+
     const consultantsForRoster = useMemo(() => {
         const gridResources = Array.isArray(capacityGridState?.resources) ? capacityGridState.resources : [];
         if (gridResources.length > 0) {
@@ -284,8 +549,8 @@ export function DashboardClient({
                 }))
                 .filter((consultant) => consultant.name.length > 0);
         }
-        return consultantsFromTasks;
-    }, [capacityGridState?.resources, consultantsFromTasks]);
+        return mergedConsultants;
+    }, [capacityGridState?.resources, mergedConsultants]);
 
     const activeConsultantNames = useMemo(
         () => consultantsForRoster
@@ -296,13 +561,157 @@ export function DashboardClient({
         [consultantsForRoster]
     );
 
+    const rosterCacheSignature = useMemo(
+        () => consultantsForRoster
+            .filter((consultant) => !Boolean((consultant as any).removed))
+            .map((consultant) => `${consultant.id}:${consultant.name}`)
+            .sort()
+            .join("|"),
+        [consultantsForRoster]
+    );
+
+    const getWeekCacheKey = useCallback((week: string, rosterSignature: string = rosterCacheSignature) => {
+        return `${week}::${rosterSignature}`;
+    }, [rosterCacheSignature]);
+
+    const applyWeekSnapshot = useCallback((week: string, snapshot: DashboardWeekSnapshot) => {
+        setDashboardConfigState((prev: any) => {
+            const currentRows = Array.isArray(prev?.capacityGridConfigsForYear) ? prev.capacityGridConfigsForYear : [];
+            const nextCapacityGridConfigsForYear = currentRows
+                .filter((row: any) => String(row?.week ?? "") !== week)
+                .concat([{ week, payload: snapshot.capacityGridConfig }])
+                .sort((a: any, b: any) => String(a?.week ?? "").localeCompare(String(b?.week ?? "")));
+
+            return {
+                ...prev,
+                weekConfig: snapshot.weekConfig,
+                leadConfigs: snapshot.leadConfigs,
+                clientConfigs: snapshot.clientConfigs,
+                clientDirectory: snapshot.clientDirectory,
+                consultantConfigs: snapshot.consultantConfigs,
+                previousLeadConfigs: snapshot.previousLeadConfigs,
+                previousClientConfigs: snapshot.previousClientConfigs,
+                previousConsultantConfigs: snapshot.previousConsultantConfigs,
+                previousTaskBillableRollups: snapshot.previousTaskBillableRollups,
+                capacityGridConfig: snapshot.capacityGridConfig,
+                capacityGridConfigsForYear: nextCapacityGridConfigsForYear,
+            };
+        });
+
+        setTaskBillableRollupsState(snapshot.taskBillableRollups ?? []);
+        setCapacityGridState(snapshot.capacityGridConfig ?? EMPTY_CAPACITY_GRID);
+        setActiveWeekStrState(week);
+    }, []);
+
+    useEffect(() => {
+        const currentSnapshot: DashboardWeekSnapshot = {
+            weekConfig: dbConfig?.weekConfig,
+            leadConfigs: dbConfig?.leadConfigs,
+            clientConfigs: dbConfig?.clientConfigs,
+            clientDirectory: dbConfig?.clientDirectory,
+            consultantConfigs: dbConfig?.consultantConfigs,
+            previousLeadConfigs: dbConfig?.previousLeadConfigs,
+            previousClientConfigs: dbConfig?.previousClientConfigs,
+            previousConsultantConfigs: dbConfig?.previousConsultantConfigs,
+            previousTaskBillableRollups: dbConfig?.previousTaskBillableRollups,
+            capacityGridConfig: dbConfig?.capacityGridConfig ?? EMPTY_CAPACITY_GRID,
+            taskBillableRollups: initialTaskBillableRollups,
+        };
+        weekSnapshotCacheRef.current.set(getWeekCacheKey(weekStartStr), currentSnapshot);
+    }, [dbConfig, getWeekCacheKey, initialTaskBillableRollups, weekStartStr]);
+
+    const prefetchWeekSnapshot = useCallback((week: string) => {
+        const cacheKey = getWeekCacheKey(week);
+        if (weekSnapshotCacheRef.current.has(cacheKey) || weekPrefetchInFlightRef.current.has(cacheKey)) {
+            return;
+        }
+
+        weekPrefetchInFlightRef.current.add(cacheKey);
+        void loadDashboardWeekData(
+            week,
+            consultantsForRoster.map((consultant) => ({ id: consultant.id, name: consultant.name }))
+        ).then((snapshot) => {
+            weekSnapshotCacheRef.current.set(cacheKey, snapshot);
+        }).catch(() => {
+            // Ignore prefetch failures; the explicit navigation path will retry.
+        }).finally(() => {
+            weekPrefetchInFlightRef.current.delete(cacheKey);
+        });
+    }, [consultantsForRoster, getWeekCacheKey]);
+
+    useEffect(() => {
+        const activeWeekDate = new Date(`${activeWeekStrState}T00:00:00`);
+        const previousWeek = new Date(activeWeekDate);
+        previousWeek.setDate(previousWeek.getDate() - 7);
+        const nextWeek = new Date(activeWeekDate);
+        nextWeek.setDate(nextWeek.getDate() + 7);
+        prefetchWeekSnapshot(previousWeek.toISOString().slice(0, 10));
+        prefetchWeekSnapshot(nextWeek.toISOString().slice(0, 10));
+    }, [activeWeekStrState, prefetchWeekSnapshot]);
+
+    const handleWeekChange = useCallback((nextWeek: string) => {
+        if (nextWeek === activeWeekStrState) return;
+
+        const currentYear = new Date(`${activeWeekStrState}T00:00:00`).getFullYear();
+        const nextYear = new Date(`${nextWeek}T00:00:00`).getFullYear();
+        const nextHref = buildDashboardHref(nextWeek, resolvedActiveTab, selectedListIdState, selectedFolderIdState, selectedAssigneeFilterState);
+
+        if (nextYear !== currentYear) {
+            router.push(nextHref, { scroll: false });
+            return;
+        }
+
+        const requestId = weekRequestIdRef.current + 1;
+        weekRequestIdRef.current = requestId;
+        setIsWeekLoading(true);
+
+        const cacheKey = getWeekCacheKey(nextWeek);
+        const cachedSnapshot = weekSnapshotCacheRef.current.get(cacheKey);
+        if (cachedSnapshot) {
+            applyWeekSnapshot(nextWeek, cachedSnapshot);
+            syncBrowserUrl(nextHref);
+            setIsWeekLoading(false);
+            return;
+        }
+
+        void loadDashboardWeekData(
+            nextWeek,
+            consultantsForRoster.map((consultant) => ({ id: consultant.id, name: consultant.name }))
+        ).then((snapshot) => {
+            weekSnapshotCacheRef.current.set(cacheKey, snapshot);
+            if (weekRequestIdRef.current !== requestId) return;
+            applyWeekSnapshot(nextWeek, snapshot);
+            syncBrowserUrl(nextHref);
+        }).catch((error) => {
+            if (weekRequestIdRef.current === requestId) {
+                console.error("Failed to load dashboard week snapshot", error);
+            }
+        }).finally(() => {
+            if (weekRequestIdRef.current === requestId) {
+                setIsWeekLoading(false);
+            }
+        });
+    }, [
+        activeWeekStrState,
+        applyWeekSnapshot,
+        buildDashboardHref,
+        consultantsForRoster,
+        getWeekCacheKey,
+        resolvedActiveTab,
+        router,
+        selectedAssigneeFilterState,
+        selectedFolderIdState,
+        selectedListIdState,
+        syncBrowserUrl,
+    ]);
+
     const baseConsultantConfigsById = useMemo(() => {
         const byId = new Map<number, { maxCapacity: number; billableCapacity: number; notes: string }>();
         consultantsForRoster.forEach((consultant) => {
             byId.set(consultant.id, { maxCapacity: 40, billableCapacity: 40, notes: "" });
         });
 
-        const consultantConfigs = Array.isArray(dbConfig?.consultantConfigs) ? dbConfig.consultantConfigs : [];
+        const consultantConfigs = Array.isArray(dashboardConfigState?.consultantConfigs) ? dashboardConfigState.consultantConfigs : [];
         consultantConfigs.forEach((cfg: any) => {
             const consultantId = Number(cfg?.consultantId ?? 0);
             if (consultantId <= 0) return;
@@ -319,13 +728,13 @@ export function DashboardClient({
             result[consultantId] = value;
         });
         return result;
-    }, [consultantsForRoster, dbConfig?.consultantConfigs]);
+    }, [consultantsForRoster, dashboardConfigState?.consultantConfigs]);
 
     const [consultantConfigsState, setConsultantConfigsState] = useState<Record<number, { maxCapacity: number; billableCapacity: number; notes: string }>>(baseConsultantConfigsById);
 
     useEffect(() => {
         setConsultantConfigsState(baseConsultantConfigsById);
-    }, [weekStartStr, baseConsultantConfigsById]);
+    }, [activeWeekStrState, baseConsultantConfigsById]);
 
     const consultantConfigsForCommandCenter = useMemo(() => {
         return Object.entries(consultantConfigsState).map(([consultantId, cfg]) => ({
@@ -342,7 +751,7 @@ export function DashboardClient({
             byId.set(consultant.id, { maxCapacity: 40, billableCapacity: 40, notes: "" });
         });
 
-        const prevRows = Array.isArray(dbConfig?.previousConsultantConfigs) ? dbConfig.previousConsultantConfigs : [];
+        const prevRows = Array.isArray(dashboardConfigState?.previousConsultantConfigs) ? dashboardConfigState.previousConsultantConfigs : [];
         prevRows.forEach((cfg: any) => {
             const consultantId = Number(cfg?.consultantId ?? 0);
             if (consultantId <= 0) return;
@@ -360,14 +769,15 @@ export function DashboardClient({
             billableCapacity: Number(cfg.billableCapacity ?? 40),
             notes: String(cfg.notes ?? ""),
         }));
-    }, [consultantsFromTasks, dbConfig?.previousConsultantConfigs]);
+    }, [consultantsFromTasks, dashboardConfigState?.previousConsultantConfigs]);
 
     const mergedDbConfig = useMemo(() => ({
-        ...dbConfig,
+        ...dashboardConfigState,
         capacityGridConfig: capacityGridState,
+        taskBillableRollups: taskBillableRollupsState,
         consultantConfigs: consultantConfigsForCommandCenter,
         previousConsultantConfigs: previousConsultantConfigsForCommandCenter,
-    }), [dbConfig, capacityGridState, consultantConfigsForCommandCenter, previousConsultantConfigsForCommandCenter]);
+    }), [dashboardConfigState, capacityGridState, consultantConfigsForCommandCenter, previousConsultantConfigsForCommandCenter, taskBillableRollupsState]);
 
     const handleConsultantConfigChange = (
         consultantId: number,
@@ -382,19 +792,24 @@ export function DashboardClient({
         }));
     };
 
+    const handleConsultantConfigReplace = useCallback((nextConfigs: Record<number, { maxCapacity: number; billableCapacity: number; notes: string }>) => {
+        setConsultantConfigsState(nextConfigs);
+    }, []);
+
     return (
         <div className="flex h-screen w-full bg-background overflow-hidden text-sm selection:bg-primary/30 selection:text-white">
             <Sidebar
                 folders={availableFolders}
-                selectedListId={selectedListId}
-                selectedFolderId={selectedFolderId}
+                clientOptions={clientOptions}
+                selectedListId={selectedListIdState}
+                selectedFolderId={selectedFolderIdState}
                 activeTab={resolvedActiveTab}
-                weekStr={weekStartStr}
-                assigneeFilter={selectedAssigneeFilter}
+                weekStr={activeWeekStrState}
+                assigneeFilter={selectedAssigneeFilterState}
                 onSelectList={handleListSelect}
                 onSelectFolder={handleFolderSelect}
                 onSelectTab={handleTabSelect}
-                teamsLabel="Clients"
+                teamsLabel="Teams"
             />
 
             <main className="flex-1 flex flex-col h-full overflow-hidden relative">
@@ -430,14 +845,17 @@ export function DashboardClient({
                     {resolvedActiveTab === "issues" && (
                         <section className="flex-1 flex flex-col min-h-[400px]">
                             <EditableTaskBoard
-                                activeWeekStr={weekStartStr}
+                                activeWeekStr={activeWeekStrState}
                                 tasks={proServicesTasks}
                                 scopeType={editableTaskScope.type}
                                 scopeId={editableTaskScope.id}
                                 scopeName={editableTaskScope.name}
+                                scopeParentFolderId={selectedBoardMeta?.parentFolderId ?? null}
                                 assigneeOptions={activeConsultantNames}
-                                initialAssigneeFilter={selectedAssigneeFilter}
+                                initialAssigneeFilter={selectedAssigneeFilterState}
                                 tabId="issues"
+                                onNavigateWeek={handleWeekChange}
+                                onAssigneeFilterChange={handleAssigneeFilterChange}
                             />
                         </section>
                     )}
@@ -447,8 +865,10 @@ export function DashboardClient({
                             <CommandCenter
                                 tasks={proServicesTasks}
                                 timeEntries={initialTimeEntries}
-                                activeWeekStr={weekStartStr}
+                                activeWeekStr={activeWeekStrState}
                                 dbConfig={mergedDbConfig}
+                                onNavigateWeek={handleWeekChange}
+                                isWeekLoading={isWeekLoading}
                             />
                         </section>
                     )}
@@ -456,8 +876,10 @@ export function DashboardClient({
                     {resolvedActiveTab === "trends" && (
                         <section className="flex-1 flex flex-col min-h-[400px]">
                             <Trends
-                                activeWeekStr={weekStartStr}
+                                activeWeekStr={activeWeekStrState}
                                 weeklyTrend={Array.isArray(mergedDbConfig?.weeklyTrend) ? mergedDbConfig.weeklyTrend : []}
+                                onNavigateWeek={handleWeekChange}
+                                isWeekLoading={isWeekLoading}
                             />
                         </section>
                     )}
@@ -465,11 +887,13 @@ export function DashboardClient({
                     {resolvedActiveTab === "capacity-trends" && (
                         <section className="flex-1 flex flex-col min-h-[400px]">
                             <CapacityTrends
-                                activeWeekStr={weekStartStr}
+                                activeWeekStr={activeWeekStrState}
                                 consultants={consultantsFromTasks}
                                 consultantConfigsForYear={Array.isArray(mergedDbConfig?.consultantConfigsForYear) ? mergedDbConfig.consultantConfigsForYear : []}
                                 consultantConfigsCurrentWeek={Array.isArray(mergedDbConfig?.consultantConfigs) ? mergedDbConfig.consultantConfigs : []}
                                 capacityGridConfigsForYear={Array.isArray(mergedDbConfig?.capacityGridConfigsForYear) ? mergedDbConfig.capacityGridConfigsForYear : []}
+                                onNavigateWeek={handleWeekChange}
+                                isWeekLoading={isWeekLoading}
                             />
                         </section>
                     )}
@@ -477,28 +901,57 @@ export function DashboardClient({
                     {resolvedActiveTab === "capacity-grid" && (
                         <section className="flex-1 flex flex-col min-h-[400px]">
                             <CapacityGrid
-                                activeWeekStr={weekStartStr}
+                                activeWeekStr={activeWeekStrState}
                                 initialGrid={capacityGridState}
                                 onGridChange={setCapacityGridState}
                                 consultants={consultantsForRoster}
                                 consultantConfigsById={consultantConfigsState}
+                                clientDirectory={Array.isArray(dashboardConfigState?.clientDirectory) ? dashboardConfigState.clientDirectory : []}
                                 tasks={proServicesTasks}
                                 folders={availableFolders}
-                                activeAssigneeFilter={selectedAssigneeFilter}
-                                billableRollups={initialTaskBillableRollups}
+                                activeAssigneeFilter={selectedAssigneeFilterState}
+                                billableRollups={taskBillableRollupsState}
+                                onNavigateWeek={handleWeekChange}
+                                onSelectTab={handleTabSelect}
+                                isWeekLoading={isWeekLoading}
                             />
+                        </section>
+                    )}
+
+                    {resolvedActiveTab === "client-setup" && (
+                        <section className="flex-1 flex flex-col min-h-[400px]">
+                            <ClientSetup initialClients={Array.isArray(dashboardConfigState?.clientDirectory) ? dashboardConfigState.clientDirectory : []} />
                         </section>
                     )}
 
                     {resolvedActiveTab === "consultant-utilization" && (
                         <section className="flex-1 flex flex-col min-h-[400px]">
                             <ConsultantUtilization
-                                activeWeekStr={weekStartStr}
+                                activeWeekStr={activeWeekStrState}
                                 consultants={consultantsForRoster}
+                                consultantDirectory={consultantsFromDirectory}
                                 consultantConfigsById={consultantConfigsState}
                                 capacityGrid={capacityGridState}
                                 onConsultantConfigChange={handleConsultantConfigChange}
+                                onConsultantConfigReplace={handleConsultantConfigReplace}
                                 onCapacityGridChange={setCapacityGridState}
+                                onNavigateWeek={handleWeekChange}
+                                isWeekLoading={isWeekLoading}
+                            />
+                        </section>
+                    )}
+
+                    {resolvedActiveTab === "timesheets" && (
+                        <section className="flex-1 flex flex-col min-h-[400px]">
+                            <Timesheets
+                                activeWeekStr={activeWeekStrState}
+                                tasks={proServicesTasks}
+                                consultants={consultantsForRoster}
+                                capacityGrid={capacityGridState}
+                                initialAssigneeFilter={selectedAssigneeFilterState}
+                                onNavigateWeek={handleWeekChange}
+                                onAssigneeFilterChange={handleTimesheetAssigneeFilterChange}
+                                isWeekLoading={isWeekLoading}
                             />
                         </section>
                     )}
