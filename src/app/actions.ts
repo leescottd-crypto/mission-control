@@ -2329,12 +2329,14 @@ export async function getEditableTasks(
         });
     }
 
-    const stalePlaceholderIds = existingRows
-        .filter((row: any) => {
-            const sourceTaskId = String(row?.sourceTaskId ?? "").trim();
-            return sourceTaskId && !allowedSourceTaskIds.has(sourceTaskId);
-        })
-        .map((row: any) => String(row.id));
+    const stalePlaceholderIds = allowedSourceTaskIds.size > 0
+        ? existingRows
+            .filter((row: any) => {
+                const sourceTaskId = String(row?.sourceTaskId ?? "").trim();
+                return sourceTaskId && !allowedSourceTaskIds.has(sourceTaskId);
+            })
+            .map((row: any) => String(row.id))
+        : [];
 
     if (stalePlaceholderIds.length > 0) {
         await editableTaskModel.deleteMany({
