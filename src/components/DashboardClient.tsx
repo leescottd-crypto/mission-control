@@ -254,6 +254,43 @@ export function DashboardClient({
             });
         });
 
+        // Reconstruct missing folders from placements when ClickUp API is unavailable.
+        // First pass: group placements by parentFolderId to derive the best folder name.
+        const placementsByFolder = new Map<string, Array<{ boardName: string | null; clientName: string | null }>>();
+        (initialSidebarStructure?.placements ?? []).forEach((placement) => {
+            const folderId = String(placement.parentFolderId ?? "");
+            if (!folderId) return;
+            const existing = placementsByFolder.get(folderId) ?? [];
+            existing.push({ boardName: placement.boardName ?? null, clientName: placement.clientName ?? null });
+            placementsByFolder.set(folderId, existing);
+        });
+        placementsByFolder.forEach((items, folderId) => {
+            if (folderCatalog.has(folderId) || hiddenFolderIds.has(folderId)) return;
+            const override = folderOverrideMap.get(`clickup:${folderId}`) ?? folderOverrideMap.get(`local:${folderId}`);
+            let derivedName = override?.name ?? null;
+            if (!derivedName) {
+                // Derive name from client names: if all share a prefix, use it; otherwise list unique clients
+                const clientNames = items.map((p) => p.clientName).filter(Boolean) as string[];
+                const uniqueClients = Array.from(new Set(clientNames));
+                if (uniqueClients.length === 1) {
+                    derivedName = uniqueClients[0];
+                } else if (uniqueClients.length > 0 && uniqueClients.length <= 3) {
+                    derivedName = uniqueClients.join(", ");
+                } else if (uniqueClients.length > 3) {
+                    derivedName = `${uniqueClients.slice(0, 3).join(", ")} +${uniqueClients.length - 3}`;
+                } else {
+                    // Fall back to first board name
+                    const firstBoard = items.find((p) => p.boardName)?.boardName;
+                    derivedName = firstBoard ?? `Folder ${folderId}`;
+                }
+            }
+            folderCatalog.set(folderId, {
+                id: folderId,
+                name: String(derivedName),
+                source: "clickup",
+            });
+        });
+
         const boardBuckets = new Map<
             string,
             Array<{
@@ -324,6 +361,22 @@ export function DashboardClient({
                 });
             });
 
+        // Push boards from placements when ClickUp API boards are unavailable
+        (initialSidebarStructure?.placements ?? []).forEach((placement) => {
+            const boardId = String(placement.boardId ?? "");
+            const folderId = String(placement.parentFolderId ?? "");
+            if (!boardId || !folderId || hiddenBoardIds.has(boardId) || hiddenFolderIds.has(folderId)) return;
+            const existingBucket = boardBuckets.get(folderId) ?? [];
+            if (existingBucket.some((b) => b.id === boardId)) return;
+            pushBoard({
+                id: boardId,
+                name: String(placement.boardName ?? boardId),
+                source: placement.source === "local" ? "local" : "clickup",
+                defaultFolderId: folderId,
+                defaultOrder: Number(placement.orderIndex ?? 0),
+            });
+        });
+
         const buildFolder = (folderId: string): FolderWithLists | null => {
             const folder = folderCatalog.get(folderId);
             if (!folder) return null;
@@ -343,16 +396,30 @@ export function DashboardClient({
         };
 
         if (initialFolders.length > 0) {
+            const includedFolderIds = new Set<string>();
             const clickupFolders = initialFolders
                 .filter((folder) => !hiddenFolderIds.has(String(folder.id)))
                 .map((folder) => buildFolder(String(folder.id)))
-                .filter((folder): folder is FolderWithLists => folder !== null);
+                .filter((folder): folder is FolderWithLists => {
+                    if (!folder) return false;
+                    includedFolderIds.add(folder.id);
+                    return true;
+                });
             const localFolders = (initialSidebarStructure?.folders ?? [])
                 .filter((folder) => !hiddenFolderIds.has(String(folder.id)))
                 .map((folder) => buildFolder(String(folder.id)))
+                .filter((folder): folder is FolderWithLists => {
+                    if (!folder) return false;
+                    includedFolderIds.add(folder.id);
+                    return true;
+                });
+            // Build folders that exist only in placements (not in ClickUp API or local DB folders)
+            const placementFolders = Array.from(folderCatalog.keys())
+                .filter((folderId) => !includedFolderIds.has(folderId))
+                .map((folderId) => buildFolder(folderId))
                 .filter((folder): folder is FolderWithLists => folder !== null);
 
-            return [...clickupFolders, ...localFolders];
+            return [...clickupFolders, ...localFolders, ...placementFolders];
         }
 
         const folderMap = new Map<string, { id: string, name: string, source: "clickup", lists: Map<string, { id: string, name: string, statusOrder: string[], source: "clickup" }> }>();
@@ -391,14 +458,28 @@ export function DashboardClient({
             });
         });
 
+        const includedFolderIds = new Set<string>();
         const clickupFolders = Array.from(folderMap.values())
             .map((folder) => buildFolder(String(folder.id)))
-            .filter((folder): folder is FolderWithLists => folder !== null);
+            .filter((folder): folder is FolderWithLists => {
+                if (!folder) return false;
+                includedFolderIds.add(folder.id);
+                return true;
+            });
         const localFolders = (initialSidebarStructure?.folders ?? [])
             .map((folder) => buildFolder(String(folder.id)))
+            .filter((folder): folder is FolderWithLists => {
+                if (!folder) return false;
+                includedFolderIds.add(folder.id);
+                return true;
+            });
+        // Build folders that exist only in placements (not in ClickUp task data or local DB folders)
+        const placementFolders = Array.from(folderCatalog.keys())
+            .filter((folderId) => !includedFolderIds.has(folderId))
+            .map((folderId) => buildFolder(folderId))
             .filter((folder): folder is FolderWithLists => folder !== null);
 
-        return [...clickupFolders, ...localFolders];
+        return [...clickupFolders, ...localFolders, ...placementFolders];
     }, [clientOptions, initialFolders, initialSidebarStructure, proServicesTasks]);
 
     const handleListSelect = (listId: string | null) => {
