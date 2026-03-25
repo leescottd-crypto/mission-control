@@ -46,6 +46,8 @@ type ClientOption = {
     name: string;
 };
 
+type DashboardExtraParams = Record<string, string | null | undefined>;
+
 const EMPTY_CAPACITY_GRID: CapacityGridPayload = { resources: [], rows: [] };
 const VALID_TABS = new Set(["issues", "editable-tasks", "command-center", "trends", "capacity-trends", "consultant-utilization", "timesheets", "capacity-grid", "client-setup", "backlog-growth"]);
 const normalizeTab = (tab?: string) => (tab && VALID_TABS.has(tab) ? tab : "command-center");
@@ -123,7 +125,8 @@ export function DashboardClient({
         nextTab: string,
         nextListId: string | null,
         nextFolderId: string | null,
-        nextAssignee: string | null = selectedAssigneeFilterState
+        nextAssignee: string | null = selectedAssigneeFilterState,
+        extraParams: DashboardExtraParams = {}
     ) => {
         const params = new URLSearchParams(searchParams.toString());
         params.set("week", nextWeek);
@@ -143,6 +146,15 @@ export function DashboardClient({
             params.delete("listId");
             params.delete("folderId");
         }
+        params.delete("returnTo");
+        Object.entries(extraParams).forEach(([key, value]) => {
+            const nextValue = String(value ?? "").trim();
+            if (nextValue.length > 0) {
+                params.set(key, nextValue);
+            } else {
+                params.delete(key);
+            }
+        });
         return `${pathname}?${params.toString()}`;
     }, [pathname, searchParams, selectedAssigneeFilterState]);
 
@@ -155,14 +167,15 @@ export function DashboardClient({
         nextTab: string,
         nextListId: string | null,
         nextFolderId: string | null,
-        nextAssignee: string | null = selectedAssigneeFilterState
+        nextAssignee: string | null = selectedAssigneeFilterState,
+        extraParams: DashboardExtraParams = {}
     ) => {
         const normalizedTab = normalizeTab(nextTab);
         setActiveTabState(normalizedTab);
         setSelectedListIdState(nextListId);
         setSelectedFolderIdState(nextFolderId);
         setSelectedAssigneeFilterState(nextAssignee);
-        syncBrowserUrl(buildDashboardHref(activeWeekStrState, normalizedTab, nextListId, nextFolderId, nextAssignee));
+        syncBrowserUrl(buildDashboardHref(activeWeekStrState, normalizedTab, nextListId, nextFolderId, nextAssignee, extraParams));
     }, [activeWeekStrState, buildDashboardHref, selectedAssigneeFilterState, syncBrowserUrl]);
 
     // Filter tasks down strictly to the Professional Services space
@@ -410,6 +423,23 @@ export function DashboardClient({
     const handleTimesheetAssigneeFilterChange = useCallback((nextAssignee: string | null) => {
         navigateWithState("timesheets", selectedListIdState, selectedFolderIdState, nextAssignee);
     }, [navigateWithState, selectedFolderIdState, selectedListIdState]);
+
+    const handleCapacityGridOpenTaskBoard = useCallback((
+        target: {
+            listId?: string | null;
+            folderId?: string | null;
+            assignee?: string | null;
+            returnTo?: string | null;
+        }
+    ) => {
+        navigateWithState(
+            "issues",
+            target.listId ?? null,
+            target.folderId ?? null,
+            target.assignee ?? null,
+            { returnTo: target.returnTo ?? null }
+        );
+    }, [navigateWithState]);
 
     // 3. Slice tasks based on active Client (List) or Team (Folder)
     const visibleTasks = useMemo(() => {
@@ -813,7 +843,7 @@ export function DashboardClient({
 
             <main className="flex-1 flex flex-col h-full overflow-hidden relative">
                 {/* Header Bar */}
-                <header className="h-14 border-b border-border flex items-center justify-between px-6 shrink-0 bg-background/90 backdrop-blur-md z-20">
+                <header className="h-[68px] border-b border-border flex items-center justify-between px-6 pt-2 shrink-0 bg-background/90 backdrop-blur-md z-20">
                     <div className="flex items-center gap-3">
                         <MissionEngineMark className="h-9 w-9 rounded-xl" />
                         <div className="min-w-0">
@@ -913,6 +943,7 @@ export function DashboardClient({
                                 billableRollups={taskBillableRollupsState}
                                 onNavigateWeek={handleWeekChange}
                                 onSelectTab={handleTabSelect}
+                                onOpenTaskBoard={handleCapacityGridOpenTaskBoard}
                                 isWeekLoading={isWeekLoading}
                             />
                         </section>

@@ -378,7 +378,7 @@ export function EditableTaskBoard({
             scopeId,
             subject: "New Task",
             description: "",
-            assignee: "",
+            assignee: String(initialAssigneeFilter ?? "").trim(),
             isAi: false,
             billableHoursToday: 0,
             status: "backlog",

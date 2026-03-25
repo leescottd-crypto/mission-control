@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState, useTransition, type FocusEvent } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { addDays, addWeeks, format, startOfWeek, subWeeks } from "date-fns";
 import {
@@ -31,6 +31,12 @@ interface CapacityGridProps {
     billableRollups?: EditableTaskBillableRollupRecord[];
     onNavigateWeek?: (nextWeek: string) => void;
     onSelectTab?: (tab: string) => void;
+    onOpenTaskBoard?: (target: {
+        listId?: string | null;
+        folderId?: string | null;
+        assignee?: string | null;
+        returnTo?: string | null;
+    }) => void;
     isWeekLoading?: boolean;
 }
 
@@ -64,6 +70,13 @@ function clientIdFromName(value: string) {
 
 function clampNonNegative(value: number) {
     return Math.max(0, value);
+}
+
+function selectInputValueOnFocus(event: FocusEvent<HTMLInputElement>) {
+    const input = event.currentTarget;
+    requestAnimationFrame(() => {
+        input.select();
+    });
 }
 
 function sanitizeCapacityRows(rows: CapacityGridRow[] = []): CapacityGridRow[] {
@@ -121,6 +134,7 @@ export function CapacityGrid({
     billableRollups = [],
     onNavigateWeek,
     onSelectTab,
+    onOpenTaskBoard,
     isWeekLoading = false,
 }: CapacityGridProps) {
     const router = useRouter();
@@ -181,6 +195,17 @@ export function CapacityGrid({
         return byId;
     }, [tasks]);
 
+    const folderBoardEntries = useMemo(() => (
+        folders.flatMap((folder) =>
+            folder.lists.map((list) => ({
+                id: String(list.id),
+                name: String(list.name),
+                folderId: String(folder.id),
+                folderName: String(folder.name),
+            }))
+        )
+    ), [folders]);
+
     const getClientMetadata = useCallback((row: CapacityGridRow) => {
         const idKey = normalizeName(String(row.id ?? ""));
         const nameKey = normalizeName(String(row.client ?? ""));
@@ -216,51 +241,58 @@ export function CapacityGrid({
         return `${pathname}?${params.toString()}`;
     }, [activeWeekStr, pathname, searchParams]);
 
-    const resolveClientBoardHref = useCallback((row: CapacityGridRow, resource: CapacityGridResource, consultantName?: string | null) => {
+    const resolveClientBoardTarget = useCallback((row: CapacityGridRow, resource: CapacityGridResource, consultantName?: string | null) => {
         const clientName = row.client;
         const normalizedClient = normalizeName(clientName);
         if (!normalizedClient) return null;
-        const returnToParam = `&returnTo=${encodeURIComponent(buildCapacityReturnTo(row.id, resource.id))}`;
+        const returnTo = buildCapacityReturnTo(row.id, resource.id);
+        const assignee = consultantName && consultantName.trim().length > 0
+            ? consultantName.trim()
+            : activeAssigneeFilter && activeAssigneeFilter.trim().length > 0
+                ? activeAssigneeFilter.trim()
+                : null;
         const assigneeParam = consultantName && consultantName.trim().length > 0
             ? `&assignee=${encodeURIComponent(consultantName.trim())}`
             : activeAssigneeFilter && activeAssigneeFilter.trim().length > 0
                 ? `&assignee=${encodeURIComponent(activeAssigneeFilter.trim())}`
                 : "";
 
-        const exactList = folders.flatMap((folder) =>
-            folder.lists.map((list) => ({
-                type: "list" as const,
-                id: list.id,
-                name: list.name,
-                folderId: folder.id,
-                folderName: folder.name,
-            }))
-        ).find((entry) => normalizeName(entry.name) === normalizedClient);
+        const exactList = folderBoardEntries.find((entry) => normalizeName(entry.name) === normalizedClient);
 
         if (exactList) {
-            return `/?week=${activeWeekStr}&tab=issues&listId=${encodeURIComponent(exactList.id)}${assigneeParam}${returnToParam}`;
+            return {
+                listId: exactList.id,
+                folderId: null,
+                assignee,
+                returnTo,
+                href: `/?week=${activeWeekStr}&tab=issues&listId=${encodeURIComponent(exactList.id)}${assigneeParam}&returnTo=${encodeURIComponent(returnTo)}`,
+            };
         }
 
-        const fuzzyList = folders.flatMap((folder) =>
-            folder.lists.map((list) => ({
-                type: "list" as const,
-                id: list.id,
-                name: list.name,
-                folderId: folder.id,
-                folderName: folder.name,
-            }))
-        ).find((entry) => {
+        const fuzzyList = folderBoardEntries.find((entry) => {
             const entryName = normalizeName(entry.name);
             return entryName.includes(normalizedClient) || normalizedClient.includes(entryName);
         });
 
         if (fuzzyList) {
-            return `/?week=${activeWeekStr}&tab=issues&listId=${encodeURIComponent(fuzzyList.id)}${assigneeParam}${returnToParam}`;
+            return {
+                listId: fuzzyList.id,
+                folderId: null,
+                assignee,
+                returnTo,
+                href: `/?week=${activeWeekStr}&tab=issues&listId=${encodeURIComponent(fuzzyList.id)}${assigneeParam}&returnTo=${encodeURIComponent(returnTo)}`,
+            };
         }
 
         const exactFolder = folders.find((folder) => normalizeName(folder.name) === normalizedClient);
         if (exactFolder) {
-            return `/?week=${activeWeekStr}&tab=issues&folderId=${encodeURIComponent(exactFolder.id)}${assigneeParam}${returnToParam}`;
+            return {
+                listId: null,
+                folderId: String(exactFolder.id),
+                assignee,
+                returnTo,
+                href: `/?week=${activeWeekStr}&tab=issues&folderId=${encodeURIComponent(exactFolder.id)}${assigneeParam}&returnTo=${encodeURIComponent(returnTo)}`,
+            };
         }
 
         const fuzzyFolder = folders.find((folder) => {
@@ -268,11 +300,37 @@ export function CapacityGrid({
             return folderName.includes(normalizedClient) || normalizedClient.includes(folderName);
         });
         if (fuzzyFolder) {
-            return `/?week=${activeWeekStr}&tab=issues&folderId=${encodeURIComponent(fuzzyFolder.id)}${assigneeParam}${returnToParam}`;
+            return {
+                listId: null,
+                folderId: String(fuzzyFolder.id),
+                assignee,
+                returnTo,
+                href: `/?week=${activeWeekStr}&tab=issues&folderId=${encodeURIComponent(fuzzyFolder.id)}${assigneeParam}&returnTo=${encodeURIComponent(returnTo)}`,
+            };
         }
 
         return null;
-    }, [activeAssigneeFilter, activeWeekStr, buildCapacityReturnTo, folders]);
+    }, [activeAssigneeFilter, activeWeekStr, buildCapacityReturnTo, folderBoardEntries, folders]);
+
+    const handleOpenTaskBoard = useCallback((target: {
+        listId?: string | null;
+        folderId?: string | null;
+        assignee?: string | null;
+        returnTo?: string | null;
+        href: string;
+    } | null) => {
+        if (!target) return;
+        if (onOpenTaskBoard) {
+            onOpenTaskBoard({
+                listId: target.listId ?? null,
+                folderId: target.folderId ?? null,
+                assignee: target.assignee ?? null,
+                returnTo: target.returnTo ?? null,
+            });
+            return;
+        }
+        window.location.href = target.href;
+    }, [onOpenTaskBoard]);
 
     useEffect(() => {
         const rowId = searchParams?.get("gridRowId") ?? "";
@@ -1112,7 +1170,7 @@ export function CapacityGrid({
                                                 const clickupHours = Number(clickup.planned || 0);
                                                 const actualHours = Number(getBillableActualsForCell(row, resource) || 0);
                                                 const allocationNote = String(row.allocations[resource.id]?.note ?? "");
-                                                const clientBoardHref = resolveClientBoardHref(row, resource, resource.name);
+                                                const clientBoardTarget = resolveClientBoardTarget(row, resource, resource.name);
                                                 const plannedVsActualMatch = Math.abs(plannedHours - actualHours) < 0.05;
                                                 const bothZero = Math.abs(plannedHours) < 0.05 && Math.abs(actualHours) < 0.05;
                                                 const heatMapClass = gridMode !== "view"
@@ -1139,11 +1197,10 @@ export function CapacityGrid({
                                                                     onClick={(event) => {
                                                                         event.preventDefault();
                                                                         event.stopPropagation();
-                                                                        if (!clientBoardHref) return;
-                                                                        window.location.href = clientBoardHref;
+                                                                        handleOpenTaskBoard(clientBoardTarget);
                                                                     }}
-                                                                    disabled={!clientBoardHref}
-                                                                    title={clientBoardHref ? `Open ${row.client} task board` : `No board match found for ${row.client}`}
+                                                                    disabled={!clientBoardTarget}
+                                                                    title={clientBoardTarget ? `Open ${row.client} task board` : `No board match found for ${row.client}`}
                                                                     className="inline-flex items-center justify-center rounded border border-border/50 p-[2px] text-text-muted hover:text-white hover:border-border/80 disabled:cursor-not-allowed disabled:opacity-35"
                                                                     aria-label={`Open ${row.client} task board`}
                                                                 >
@@ -1155,6 +1212,7 @@ export function CapacityGrid({
                                                                     type="text"
                                                                     inputMode="decimal"
                                                                     value={String(row.allocations[resource.id]?.hours ?? "")}
+                                                                    onFocus={selectInputValueOnFocus}
                                                                     onChange={(e) => {
                                                                         const next = e.target.value.replace(/[^0-9.]/g, "");
                                                                         updateAllocation(row.id, resource.id, clampNonNegative(toNumber(next)));

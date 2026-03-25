@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState, useTransition } from "react";
+import { useEffect, useMemo, useRef, useState, useTransition, type FocusEvent } from "react";
 import { useRouter } from "next/navigation";
 import { addDays, addWeeks, format, startOfWeek, subWeeks } from "date-fns";
 import { ChevronLeft, ChevronRight, Copy, Plus, RotateCcw, Trash2, Users, X } from "lucide-react";
@@ -42,6 +42,13 @@ function normalizeName(value: string) {
 function getAllocationHours(cell: unknown) {
     const legacyCell = cell as { hours?: number; wt?: number; wPlus?: number } | undefined;
     return Number(legacyCell?.hours ?? Number(legacyCell?.wt ?? 0) + Number(legacyCell?.wPlus ?? 0));
+}
+
+function selectInputValueOnFocus(event: FocusEvent<HTMLInputElement>) {
+    const input = event.currentTarget;
+    requestAnimationFrame(() => {
+        input.select();
+    });
 }
 
 export function ConsultantUtilization({
@@ -152,10 +159,6 @@ export function ConsultantUtilization({
                     email: consultantDirectoryById.get(Number(resource?.consultantId ?? 0))?.email || "",
                     removedAt: resource?.removedAt ? String(resource.removedAt) : "",
                 }))
-                .filter((consultant) => {
-                    if (consultant.removed) return true;
-                    return consultantDirectoryById.has(consultant.id);
-                })
                 .filter((consultant) => consultant.name.length > 0)
                 .sort((a, b) => a.name.localeCompare(b.name));
         }
@@ -533,6 +536,7 @@ export function ConsultantUtilization({
                                                 type="number"
                                                 disabled={isPastWeek}
                                                 value={cfg.maxCapacity ?? 40}
+                                                onFocus={selectInputValueOnFocus}
                                                 onChange={(e) => onConsultantConfigChange?.(consultant.id, { maxCapacity: Number(e.target.value) })}
                                                 onBlur={(e) => persistConsultant(consultant.id, { maxCapacity: Number(e.target.value) })}
                                                 className="w-16 bg-surface border border-border rounded px-2 py-1 focus:border-indigo-500 outline-none transition-colors text-white font-medium disabled:opacity-50 disabled:cursor-not-allowed text-xs"
@@ -543,6 +547,7 @@ export function ConsultantUtilization({
                                                 type="number"
                                                 disabled={isPastWeek}
                                                 value={cfg.billableCapacity ?? 40}
+                                                onFocus={selectInputValueOnFocus}
                                                 onChange={(e) => onConsultantConfigChange?.(consultant.id, { billableCapacity: Number(e.target.value) })}
                                                 onBlur={(e) => persistConsultant(consultant.id, { billableCapacity: Number(e.target.value) })}
                                                 className="w-20 bg-transparent border border-amber-500/30 rounded px-2 py-1 focus:border-amber-500 outline-none transition-colors text-amber-400 font-medium disabled:opacity-50 disabled:cursor-not-allowed text-xs"

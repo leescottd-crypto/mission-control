@@ -1444,10 +1444,7 @@ async function ensureConsultantExistsForUser(input: {
         return;
     }
 
-    let consultantId = -Date.now();
-    while (await prisma.consultant.findUnique({ where: { id: consultantId } })) {
-        consultantId -= 1;
-    }
+    const consultantId = await allocateManualConsultantId();
 
     await prisma.consultant.create({
         data: {
@@ -1488,6 +1485,22 @@ export async function updateConsultantConfig(week: string, consultantId: number,
     revalidatePath("/");
 }
 
+async function allocateManualConsultantId(): Promise<number> {
+    const lowestConsultant = await prisma.consultant.findFirst({
+        orderBy: { id: "asc" },
+        select: { id: true },
+    });
+    const candidate = typeof lowestConsultant?.id === "number" && lowestConsultant.id < 0
+        ? lowestConsultant.id - 1
+        : -1;
+
+    if (candidate < -2147483648) {
+        throw new Error("No more available manual consultant IDs.");
+    }
+
+    return candidate;
+}
+
 export async function createConsultant(input: {
     firstName: string;
     lastName: string;
@@ -1510,10 +1523,7 @@ export async function createConsultant(input: {
         throw new Error("Enter a valid email address.");
     }
 
-    let consultantId = -Date.now();
-    while (await prisma.consultant.findUnique({ where: { id: consultantId } })) {
-        consultantId -= 1;
-    }
+    const consultantId = await allocateManualConsultantId();
 
     try {
         const created = await prisma.consultant.create({
@@ -2282,6 +2292,42 @@ export async function getEditableTasks(
             .map((task) => String(task?.sourceTaskId ?? "").trim())
             .filter(Boolean)
     );
+    const canonicalStatusBySourceTaskId = new Map<string, { status: "backlog" | "open" | "closed"; priority: number; updatedAtMs: number }>();
+
+    if (allowedSourceTaskIds.size > 0) {
+        const siblingRows = await editableTaskModel.findMany({
+            where: {
+                week,
+                sourceTaskId: {
+                    in: Array.from(allowedSourceTaskIds),
+                },
+            },
+            select: {
+                sourceTaskId: true,
+                scopeType: true,
+                scopeId: true,
+                status: true,
+                updatedAt: true,
+            },
+        });
+
+        siblingRows.forEach((row: any) => {
+            const sourceTaskId = String(row?.sourceTaskId ?? "").trim();
+            if (!sourceTaskId) return;
+
+            const priority = String(row?.scopeType ?? "") === "all" && String(row?.scopeId ?? "") === "all" ? 1 : 2;
+            const updatedAtMs = new Date(row?.updatedAt ?? 0).getTime();
+            const current = canonicalStatusBySourceTaskId.get(sourceTaskId);
+
+            if (!current || priority > current.priority || (priority === current.priority && updatedAtMs >= current.updatedAtMs)) {
+                canonicalStatusBySourceTaskId.set(sourceTaskId, {
+                    status: normalizeEditableTaskStatus(String(row?.status ?? "backlog")),
+                    priority,
+                    updatedAtMs,
+                });
+            }
+        });
+    }
 
     const stalePlaceholderIds = existingRows
         .filter((row: any) => {
@@ -2340,7 +2386,8 @@ export async function getEditableTasks(
 
     for (const task of filteredSeedTasks) {
         const sourceTaskId = String(task?.sourceTaskId ?? "").trim();
-        const status = normalizeEditableTaskStatus(String(task?.status ?? "backlog"));
+        const status = canonicalStatusBySourceTaskId.get(sourceTaskId)?.status
+            ?? normalizeEditableTaskStatus(String(task?.status ?? "backlog"));
         if (!sourceTaskId) continue;
 
         const existingRow: any = refreshedExistingBySourceTaskId.get(sourceTaskId);
@@ -2516,6 +2563,14 @@ export async function updateEditableTask(
 ) {
     const editableTaskModel = (prisma as any).editableTask;
     if (!editableTaskModel) return;
+    const currentTask = await editableTaskModel.findUnique({
+        where: { id: String(taskId) },
+        select: {
+            id: true,
+            week: true,
+            sourceTaskId: true,
+        },
+    });
 
     const updateData: Record<string, unknown> = {};
     if (typeof data.week === "string") updateData.week = data.week;
@@ -2531,6 +2586,21 @@ export async function updateEditableTask(
         where: { id: taskId },
         data: updateData,
     });
+
+    if (currentTask?.sourceTaskId && typeof updateData.status === "string") {
+        await editableTaskModel.updateMany({
+            where: {
+                week: String(currentTask.week),
+                sourceTaskId: String(currentTask.sourceTaskId),
+                id: {
+                    not: String(taskId),
+                },
+            },
+            data: {
+                status: updateData.status,
+            },
+        });
+    }
 
     revalidatePath("/");
 }

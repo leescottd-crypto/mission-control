@@ -21,6 +21,35 @@ npm run dev
 
 The app will start on [http://localhost:3000](http://localhost:3000).
 
+## Testing
+
+Run the core checks:
+
+```bash
+npm run lint
+npm run build
+```
+
+Run the browser smoke suite:
+
+```bash
+npm run test:smoke
+```
+
+Useful variants:
+
+```bash
+npm run test:smoke:headed
+npm run test:full
+```
+
+Notes:
+
+- `test:smoke` launches the app on `http://127.0.0.1:3100`
+- it clones `dev.db` into a temporary SQLite file so the suite does not mutate your main local database
+- it runs `prisma db push` against that temporary database so the smoke environment matches the current schema
+- it uses an isolated `.next-smoke-*` build directory so smoke runs do not corrupt your normal `.next` cache
+
 ## Required Environment Variables
 
 - `DATABASE_URL`

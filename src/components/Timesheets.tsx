@@ -248,7 +248,7 @@ export function Timesheets({
         const selectedKey = normalizeName(selectedConsultant);
         return editableTasks
             .filter((task) => normalizeName(task.assignee) === selectedKey)
-            .filter((task) => task.status !== "closed")
+            .filter((task) => task.status === "open")
             .sort((a, b) => {
                 const taskA = a.sourceTaskId ? sourceTaskById.get(String(a.sourceTaskId)) : null;
                 const taskB = b.sourceTaskId ? sourceTaskById.get(String(b.sourceTaskId)) : null;

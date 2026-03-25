@@ -457,7 +457,7 @@ export function Sidebar({
     return (
         <aside className="w-64 border-r border-border bg-background flex flex-col h-full shrink-0 relative z-10">
             {/* Top Header Placeholder */}
-            <div className="h-14 flex items-center px-4 border-b border-border shadow-sm">
+            <div className="h-[68px] flex items-center px-4 pt-2 border-b border-border shadow-sm">
                 <button
                     type="button"
                     onClick={() => onSelectTab("command-center")}
